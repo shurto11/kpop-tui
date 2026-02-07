@@ -1,0 +1,39 @@
+[package]
+name = "kpop-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# HTTP & Scraping
+reqwest = { version = "0.12", features = ["blocking"] }
+scraper = "0.22"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utils
+regex = "1"
+chrono = "0.4"
+dirs = "6"
+unicode-width = "0.2"
+open = "5"
+csv = "1"
