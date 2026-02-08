@@ -160,6 +160,8 @@ pub struct App {
     // Today's Drops用: MainMenuでロードしたartist/trackを保持
     pub home_artist: String,
     pub home_track: String,
+    /// 今日の曲が見つからず、ランダムフォールバックした場合true
+    pub is_random_fallback: bool,
 }
 
 /// ArtistData操作（undo/redo用）
@@ -306,6 +308,7 @@ impl App {
             around_day_drops: Vec::new(),
             home_artist: String::new(),
             home_track: String::new(),
+            is_random_fallback: false,
         };
         app.load_screen_data();
         app
@@ -460,9 +463,12 @@ impl App {
     fn load_screen_data(&mut self) {
         match &self.screen {
             Screen::MainMenu => {
-                // 今日のMM-DDに発売された曲からランダムに1つ選ぶ
+                // 今日のMM-DDに発売された曲からランダムに1つ選ぶ。無ければ全曲からランダム
                 let today = chrono::Local::now().format("%m-%d").to_string();
-                if let Ok(Some((artist, track))) = self.db.get_random_track_by_month_day(&today) {
+                let today_track = self.db.get_random_track_by_month_day(&today).unwrap_or(None);
+                self.is_random_fallback = today_track.is_none();
+                let picked = today_track.or_else(|| self.db.get_newest_track().unwrap_or(None));
+                if let Some((artist, track)) = picked {
                     self.home_artist = artist.clone();
                     self.home_track = track.clone();
                     self.search_results = self.db.search_song(&artist, &track).unwrap_or_default();

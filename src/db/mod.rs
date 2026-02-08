@@ -984,8 +984,25 @@ impl Database {
     /// 指定MM-DDに発売された曲からランダムに1曲取得（全曲対象、Release不問）
     pub fn get_random_track_by_month_day(&self, md: &str) -> Result<Option<(String, String)>> {
         let result = self.conn.query_row(
-            "SELECT DISTINCT artist, track FROM credit_data WHERE substr(date, 6) = ?1 ORDER BY RANDOM() LIMIT 1",
+            "SELECT DISTINCT c.artist, c.track FROM credit_data c
+             INNER JOIN track_data t ON t.artist = c.artist AND t.track = c.track
+             WHERE substr(c.date, 6) = ?1 AND t.spotify IS NOT NULL AND t.spotify != ''
+             ORDER BY RANDOM() LIMIT 1",
             [md],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// track_dataに最後に追加された曲を取得（Today's Dropsが無い日のフォールバック用）
+    pub fn get_newest_track(&self) -> Result<Option<(String, String)>> {
+        let result = self.conn.query_row(
+            "SELECT artist, track FROM track_data WHERE spotify IS NOT NULL AND spotify != '' ORDER BY id DESC LIMIT 1",
+            [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         );
         match result {

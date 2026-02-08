@@ -348,8 +348,9 @@ fn draw_main_menu(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let is_soty = app.search_track_data.as_ref().map_or(false, |td| td.is_soty);
     let track_color = if is_soty { GOLD } else { Color::Green };
+    let label = if app.is_random_fallback { "New Track: " } else { "Today's Drops: " };
     let title_bar = Paragraph::new(Line::from(vec![
-        Span::styled("Today's Drops: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
         Span::styled(&artist, Style::default().fg(Color::Cyan)),
         Span::raw(" - "),
         Span::styled(&track, Style::default().fg(track_color)),
