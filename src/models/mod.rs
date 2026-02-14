@@ -201,6 +201,9 @@ pub struct GeniusConfig {
     pub header_key: String,
     pub info_key: String,
     pub date_key: String,
+    /// Credit__Container/Label/Contributor用キー（新構造）
+    #[serde(default)]
+    pub credit_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +218,7 @@ impl Default for Config {
                 header_key: "908aafe9".to_string(),
                 info_key: "56e36c75".to_string(),
                 date_key: "hFYGNw".to_string(),
+                credit_key: "96426b7f".to_string(),
             },
             database: DatabaseConfig {
                 path: "kpop.db".to_string(),

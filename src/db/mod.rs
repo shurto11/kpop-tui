@@ -395,6 +395,12 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// credit_dataを1件削除（id指定）
+    pub fn delete_credit_by_id(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM credit_data WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// 曲データを取得（入力順、新しい順）
     pub fn get_songs_by_log(&self) -> Result<Vec<CreditData>> {
         let mut stmt = self.conn.prepare(
@@ -663,6 +669,38 @@ impl Database {
              LEFT JOIN (SELECT DISTINCT artist, track, date, album FROM credit_data) c
                     ON s.artist = c.artist AND s.track = c.track
              WHERE s.is_soty = TRUE
+             ORDER BY c.date DESC, s.artist, s.track",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TrackData {
+                id: Some(row.get(0)?),
+                artist: row.get(1)?,
+                label: row.get(2)?,
+                date: row.get(3)?,
+                album: row.get(4)?,
+                track: row.get(5)?,
+                duration: row.get(6)?,
+                bpm: row.get(7)?,
+                spotify: row.get(8)?,
+                is_title: row.get(9)?,
+                is_prerelease: row.get(10)?,
+                is_aoty: row.get(11)?,
+                is_soty: row.get(12)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// AOTYの曲一覧
+    pub fn get_aoty(&self) -> Result<Vec<TrackData>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.artist, a.label, c.date, c.album, s.track,
+                    s.duration, s.bpm, s.spotify, s.is_title, s.is_prerelease, s.is_aoty, COALESCE(s.is_soty, 0)
+             FROM track_data s
+             LEFT JOIN artist_data a ON s.artist = a.artist
+             LEFT JOIN (SELECT DISTINCT artist, track, date, album FROM credit_data) c
+                    ON s.artist = c.artist AND s.track = c.track
+             WHERE s.is_aoty = TRUE
              ORDER BY c.date DESC, s.artist, s.track",
         )?;
         let rows = stmt.query_map([], |row| {

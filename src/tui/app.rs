@@ -83,7 +83,7 @@ pub struct App {
     pub artists: Vec<ArtistData>,
     pub writers: Vec<WriterData>,
     pub tracks: Vec<TrackData>,
-    pub soty_filter: bool,
+    pub track_filter: TrackFilter,
 
     // 検索結果
     pub search_results: Vec<CreditData>,
@@ -162,6 +162,19 @@ pub struct App {
     pub home_track: String,
     /// 今日の曲が見つからず、ランダムフォールバックした場合true
     pub is_random_fallback: bool,
+
+    // ViewLog: 削除確認待ち
+    pub pending_delete_index: Option<usize>,
+    // ViewLog: 削除Undo用スタック
+    pub log_undo_stack: Vec<CreditData>,
+}
+
+/// TrackDataフィルタ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackFilter {
+    All,
+    Soty,
+    Aoty,
 }
 
 /// ArtistData操作（undo/redo用）
@@ -262,7 +275,7 @@ impl App {
             artists: Vec::new(),
             writers: Vec::new(),
             tracks: Vec::new(),
-            soty_filter: false,
+            track_filter: TrackFilter::All,
             search_results: Vec::new(),
             search_track_data: None,
             search_artist_label: None,
@@ -309,6 +322,8 @@ impl App {
             home_artist: String::new(),
             home_track: String::new(),
             is_random_fallback: false,
+            pending_delete_index: None,
+            log_undo_stack: Vec::new(),
         };
         app.load_screen_data();
         app
@@ -343,7 +358,7 @@ impl App {
         self.pending_g = false;
         self.pending_j = false;
         self.selecting_suggestion = false;
-        self.soty_filter = false;
+        self.track_filter = TrackFilter::All;
         self.aka_pairs.clear();
         self.update_menu_items();
         self.load_screen_data();
@@ -376,7 +391,7 @@ impl App {
             self.pending_g = false;
             self.pending_j = false;
             self.selecting_suggestion = false;
-            self.soty_filter = false;
+            self.track_filter = TrackFilter::All;
             self.update_menu_items();
             self.load_screen_data();
             // load_screen_dataがモードを上書きする場合があるのでNormalに戻す

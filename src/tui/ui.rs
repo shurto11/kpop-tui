@@ -264,12 +264,44 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let hints = match app.mode {
         Mode::Normal => {
-            if matches!(app.screen, Screen::MainMenu) {
-                "j/k: Move  l/Enter: Select  Q: Quit"
-            } else if matches!(app.screen, Screen::ViewArtistData) {
-                "j/k: Move  v: Visual  e: Edit  u: Undo  Ctrl+r: Redo  h: Back  q: Menu  Q: Quit"
-            } else {
-                "j/k: Move  l/Enter: Select  h/Esc: Back  /: Search  q: Menu  Q: Quit"
+            match &app.screen {
+                Screen::MainMenu => {
+                    "j/k: Move  l/Enter: Select  c: Play  x: Pause  Q: Quit"
+                }
+                Screen::InputMenu | Screen::SearchMenu | Screen::ViewMenu => {
+                    "j/k: Move  l/Enter: Select  h/Esc: Back  q: Menu  Q: Quit"
+                }
+                Screen::InputCreditData | Screen::InputArtistData
+                | Screen::InputWriterData | Screen::SearchWriter | Screen::SearchTrack => {
+                    "i: Insert  h/Esc: Back  q: Menu  Q: Quit"
+                }
+                Screen::InputTrackData => {
+                    "l: Select  a: Next BPM  i: Insert  h/Esc: Back  q: Menu  Q: Quit"
+                }
+                Screen::InputWriterAka => {
+                    "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q: Quit"
+                }
+                Screen::ViewLog => {
+                    "j/k: Move  l: Writer  d: Delete  r: Rewind  /: Search  c: Play  h: Back  q: Menu"
+                }
+                Screen::ViewCreditData => {
+                    "j/k: Move  l: Writer  /: Search  h: Back  q: Menu  Q: Quit"
+                }
+                Screen::ViewTrackData => {
+                    "j/k: Move  l: Detail  e: Edit  s: SOTY  a: AOTY  S: Toggle SOTY  A: Toggle AOTY  c: Play  /: Search  h: Back"
+                }
+                Screen::ViewArtistData => {
+                    "j/k: Move  v: Visual  e: Edit  u: Undo  Ctrl+r: Redo  /: Search  h: Back  q: Menu"
+                }
+                Screen::ViewWriterData => {
+                    "j/k: Move  l: Songs  e: Edit  /: Search  h: Back  q: Menu  Q: Quit"
+                }
+                Screen::SearchWriterResult { .. } => {
+                    "j/k: Move  l: Detail  c: Play  /: Search  h: Back  q: Menu  Q: Quit"
+                }
+                Screen::SearchTrackResult { .. } => {
+                    "j/k: Move  l: Writer  c: Play  x: Pause  /: Search  h: Back  q: Menu  Q: Quit"
+                }
             }
         }
         Mode::Insert => {
@@ -1263,10 +1295,10 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(if app.soty_filter {
-                format!("TrackData [SOTY] ({})", app.tracks.len())
-            } else {
-                format!("TrackData ({})", app.tracks.len())
+            .title(match app.track_filter {
+                crate::tui::app::TrackFilter::Soty => format!("TrackData [SOTY] ({})", app.tracks.len()),
+                crate::tui::app::TrackFilter::Aoty => format!("TrackData [AOTY] ({})", app.tracks.len()),
+                crate::tui::app::TrackFilter::All => format!("TrackData ({})", app.tracks.len()),
             }),
     );
 

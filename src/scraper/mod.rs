@@ -123,50 +123,89 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
         })
         .filter(|s| !s.is_empty());
 
-    // クレジット情報
-    let credit_selector = Selector::parse(&format!(
-        ".SongInfo__Credit-sc-{}-3",
-        config.genius.info_key
-    ))
-    .map_err(|e| anyhow::anyhow!("Invalid credit selector: {:?}", e))?;
-
-    let label_selector = Selector::parse(&format!(
-        ".SongInfo__Label-sc-{}-4",
-        config.genius.info_key
-    ))
-    .map_err(|e| anyhow::anyhow!("Invalid label selector: {:?}", e))?;
-
+    // クレジット情報（新構造: Credit__Container → 旧構造: SongInfo__Credit にフォールバック）
     let link_selector = Selector::parse("a")
         .map_err(|e| anyhow::anyhow!("Invalid link selector: {:?}", e))?;
 
     let mut credits: Vec<Credit> = Vec::new();
     let mut has_composer = false;
 
-    for credit_div in document.select(&credit_selector) {
-        if let Some(label_el) = credit_div.select(&label_selector).next() {
-            let role_raw = label_el.text().collect::<String>().trim().to_lowercase();
+    // 新構造: Credit__Container / Credit__Label / Credit__Contributor
+    if !config.genius.credit_key.is_empty() {
+        let new_credit_selector = Selector::parse(&format!(
+            ".Credit__Container-sc-{}-0",
+            config.genius.credit_key
+        ))
+        .map_err(|e| anyhow::anyhow!("Invalid new credit selector: {:?}", e))?;
 
-            // 複数形のsを削除
-            let role = if role_raw.ends_with('s') && role_raw != "lyrics" {
-                role_raw.trim_end_matches('s').to_string()
-            } else {
-                role_raw
-            };
+        let new_label_selector = Selector::parse(&format!(
+            ".Credit__Label-sc-{}-1",
+            config.genius.credit_key
+        ))
+        .map_err(|e| anyhow::anyhow!("Invalid new label selector: {:?}", e))?;
 
-            // roleを正規化
-            let normalized_role = normalize_role(&role);
-            if let Some(normalized) = normalized_role {
-                if normalized == "composer" {
-                    has_composer = true;
+        for credit_div in document.select(&new_credit_selector) {
+            if let Some(label_el) = credit_div.select(&new_label_selector).next() {
+                let role_raw = label_el.text().collect::<String>().trim().to_lowercase();
+                let role = if role_raw.ends_with('s') && role_raw != "lyrics" {
+                    role_raw.trim_end_matches('s').to_string()
+                } else {
+                    role_raw
+                };
+                let normalized_role = normalize_role(&role);
+                if let Some(normalized) = normalized_role {
+                    if normalized == "composer" {
+                        has_composer = true;
+                    }
+                    for link in credit_div.select(&link_selector) {
+                        let name = link.text().collect::<String>().trim().to_string();
+                        if !name.is_empty() {
+                            credits.push(Credit {
+                                role: normalized.to_string(),
+                                name,
+                            });
+                        }
+                    }
                 }
+            }
+        }
+    }
 
-                for link in credit_div.select(&link_selector) {
-                    let name = link.text().collect::<String>().trim().to_string();
-                    if !name.is_empty() {
-                        credits.push(Credit {
-                            role: normalized.to_string(),
-                            name,
-                        });
+    // 旧構造にフォールバック: SongInfo__Credit / SongInfo__Label
+    if credits.is_empty() {
+        let old_credit_selector = Selector::parse(&format!(
+            ".SongInfo__Credit-sc-{}-3",
+            config.genius.info_key
+        ))
+        .map_err(|e| anyhow::anyhow!("Invalid old credit selector: {:?}", e))?;
+
+        let old_label_selector = Selector::parse(&format!(
+            ".SongInfo__Label-sc-{}-4",
+            config.genius.info_key
+        ))
+        .map_err(|e| anyhow::anyhow!("Invalid old label selector: {:?}", e))?;
+
+        for credit_div in document.select(&old_credit_selector) {
+            if let Some(label_el) = credit_div.select(&old_label_selector).next() {
+                let role_raw = label_el.text().collect::<String>().trim().to_lowercase();
+                let role = if role_raw.ends_with('s') && role_raw != "lyrics" {
+                    role_raw.trim_end_matches('s').to_string()
+                } else {
+                    role_raw
+                };
+                let normalized_role = normalize_role(&role);
+                if let Some(normalized) = normalized_role {
+                    if normalized == "composer" {
+                        has_composer = true;
+                    }
+                    for link in credit_div.select(&link_selector) {
+                        let name = link.text().collect::<String>().trim().to_string();
+                        if !name.is_empty() {
+                            credits.push(Credit {
+                                role: normalized.to_string(),
+                                name,
+                            });
+                        }
                     }
                 }
             }

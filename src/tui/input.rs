@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::models::{ArtistData, BpmArtistInfo, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData};
 use crate::scraper::{find_all_tracks_in_bpm_data, make_songbpm_url, make_url, scrape_genius, scrape_songbpm};
-use crate::tui::app::{App, FormField, Mode, Screen};
+use crate::tui::app::{App, FormField, Mode, Screen, TrackFilter};
 
 /// キー入力を処理
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -36,6 +36,34 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.menu_index = 0;
             return;
         }
+    }
+
+    // ViewLog: 削除確認待ち (y/n)
+    if let Some(idx) = app.pending_delete_index {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some(credit) = app.credits.get(idx).cloned() {
+                    if let Some(id) = credit.id {
+                        if let Err(e) = app.db.delete_credit_by_id(id) {
+                            app.show_error(&format!("Delete failed: {}", e));
+                        } else {
+                            app.credits.remove(idx);
+                            app.log_undo_stack.push(credit);
+                            if app.list_index >= app.credits.len() && app.list_index > 0 {
+                                app.list_index -= 1;
+                            }
+                            app.show_message("Deleted");
+                        }
+                    }
+                }
+                app.pending_delete_index = None;
+            }
+            _ => {
+                app.pending_delete_index = None;
+                app.show_message("Cancelled");
+            }
+        }
+        return;
     }
 
     match key.code {
@@ -165,17 +193,37 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             search_prev(app);
         }
 
-        // Best16フィルタトグル
-        KeyCode::Char('b') => {
+        // a: AOTYフィルタ (ViewTrackData) / 次のBPMマッチ (InputTrackData)
+        KeyCode::Char('a') => {
             if matches!(app.screen, Screen::ViewTrackData) {
-                app.soty_filter = !app.soty_filter;
+                app.track_filter = if app.track_filter == TrackFilter::Aoty {
+                    TrackFilter::All
+                } else {
+                    TrackFilter::Aoty
+                };
                 app.list_index = 0;
                 app.list_offset = 0;
-                if app.soty_filter {
-                    app.tracks = app.db.get_soty().unwrap_or_default();
+                reload_tracks(app);
+            } else if matches!(app.screen, Screen::InputTrackData)
+                && !app.form_fields.is_empty()
+                && app.bpm_matches.len() > 1
+            {
+                app.suggestion_index = (app.suggestion_index + 1) % app.bpm_matches.len();
+                fill_form_from_bpm_match(app);
+            }
+        }
+
+        // s: SOTYフィルタ (ViewTrackData)
+        KeyCode::Char('s') => {
+            if matches!(app.screen, Screen::ViewTrackData) {
+                app.track_filter = if app.track_filter == TrackFilter::Soty {
+                    TrackFilter::All
                 } else {
-                    app.tracks = app.db.get_all_track_data().unwrap_or_default();
-                }
+                    TrackFilter::Soty
+                };
+                app.list_index = 0;
+                app.list_offset = 0;
+                reload_tracks(app);
             }
         }
 
@@ -189,11 +237,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                         Ok(is_aoty) => {
                             let status = if is_aoty { "ON" } else { "OFF" };
                             app.show_message(&format!("AOTY {} for '{}'", status, track));
-                            if app.soty_filter {
-                                app.tracks = app.db.get_soty().unwrap_or_default();
-                            } else {
-                                app.tracks = app.db.get_all_track_data().unwrap_or_default();
-                            }
+                            reload_tracks(app);
                         }
                         Err(e) => {
                             app.show_error(&format!("Failed: {}", e));
@@ -206,6 +250,42 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // SOTYトグル
         KeyCode::Char('S') => {
             handle_space(app);
+        }
+
+        // ViewLog: 削除 (y/nで確認)
+        KeyCode::Char('d') => {
+            if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
+                let c = &app.credits[app.list_index];
+                app.show_message(&format!("Delete '{} - {}'? (y/n)", c.artist, c.track));
+                app.pending_delete_index = Some(app.list_index);
+            }
+        }
+
+        // Redo (ViewArtistData)
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if matches!(app.screen, Screen::ViewArtistData) {
+                handle_artist_redo(app);
+            }
+        }
+
+        // ViewLog: リワインド（削除を元に戻す）
+        KeyCode::Char('r') => {
+            if matches!(app.screen, Screen::ViewLog) {
+                if let Some(credit) = app.log_undo_stack.pop() {
+                    match app.db.insert_song(&credit) {
+                        Ok(_) => {
+                            app.show_message(&format!("Restored '{} - {}'", credit.artist, credit.track));
+                            app.credits = app.db.get_songs_by_log().unwrap_or_default();
+                        }
+                        Err(e) => {
+                            app.show_error(&format!("Restore failed: {}", e));
+                            app.log_undo_stack.push(credit);
+                        }
+                    }
+                } else {
+                    app.show_message("Nothing to rewind");
+                }
+            }
         }
 
         // URLを開く
@@ -225,23 +305,6 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 app.spotify_playing = false;
                 app.show_message("Paused");
             }
-        }
-
-
-        // Again: 次のBPMマッチに切替
-        KeyCode::Char('a') => {
-            if matches!(app.screen, Screen::InputTrackData)
-                && !app.form_fields.is_empty()
-                && app.bpm_matches.len() > 1
-            {
-                app.suggestion_index = (app.suggestion_index + 1) % app.bpm_matches.len();
-                fill_form_from_bpm_match(app);
-            }
-        }
-
-        // ソート切替
-        KeyCode::Char('s') => {
-            // TODO: ソート切替
         }
 
         // Visualモードに入る (ViewArtistData)
@@ -344,13 +407,6 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('u') => {
             if matches!(app.screen, Screen::ViewArtistData) {
                 handle_artist_undo(app);
-            }
-        }
-
-        // Redo (ViewArtistData)
-        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if matches!(app.screen, Screen::ViewArtistData) {
-                handle_artist_redo(app);
             }
         }
 
@@ -719,6 +775,15 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
 
         _ => {}
     }
+}
+
+/// フィルタに応じてTrackDataリストを再取得
+fn reload_tracks(app: &mut App) {
+    app.tracks = match app.track_filter {
+        TrackFilter::Soty => app.db.get_soty().unwrap_or_default(),
+        TrackFilter::Aoty => app.db.get_aoty().unwrap_or_default(),
+        TrackFilter::All => app.db.get_all_track_data().unwrap_or_default(),
+    };
 }
 
 /// Artist操作のUndo
@@ -1657,12 +1722,7 @@ fn handle_space(app: &mut App) {
                     Ok(is_best) => {
                         let status = if is_best { "ON" } else { "OFF" };
                         app.show_message(&format!("SOTY {} for '{}'", status, track));
-                        // リストを更新
-                        if app.soty_filter {
-                            app.tracks = app.db.get_soty().unwrap_or_default();
-                        } else {
-                            app.tracks = app.db.get_all_track_data().unwrap_or_default();
-                        }
+                        reload_tracks(app);
                     }
                     Err(e) => {
                         app.show_error(&format!("Failed: {}", e));
@@ -1701,6 +1761,12 @@ fn handle_open_spotify(app: &mut App) {
         // SearchTrackResult / MainMenu: search_track_dataからSpotify URLを取得
         app.search_track_data.as_ref()
             .and_then(|td| td.spotify.clone())
+            .filter(|s| !s.is_empty())
+    } else if matches!(app.screen, Screen::SearchWriterResult { .. }) {
+        // SearchWriterResult: カーソル位置の曲のSpotify URLをtrack_dataから取得
+        app.search_results.get(app.list_index)
+            .and_then(|c| app.db.get_song_add(&c.artist, &c.track).ok().flatten())
+            .and_then(|td| td.spotify)
             .filter(|s| !s.is_empty())
     } else {
         None
