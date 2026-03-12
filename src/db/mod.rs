@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
-use crate::models::{ArtistData, TrackData, CreditData, WriterData};
+use crate::models::{ArtistData, TrackData, CreditData, WriterData, parse_genres, genres_to_string};
 
 pub struct Database {
     conn: Connection,
@@ -102,6 +102,9 @@ impl Database {
         // マイグレーション: is_aoty カラム追加
         self.migrate_add_aoty()?;
 
+        // マイグレーション: genres カラム追加
+        self.migrate_add_genres()?;
+
         Ok(())
     }
 
@@ -193,6 +196,23 @@ impl Database {
         if !has_aoty {
             self.conn.execute(
                 "ALTER TABLE track_data ADD COLUMN is_aoty BOOLEAN DEFAULT FALSE",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// genres カラムを追加（既存DB対応）
+    fn migrate_add_genres(&self) -> Result<()> {
+        let has_genres: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('track_data') WHERE name = 'genres'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) > 0;
+
+        if !has_genres {
+            self.conn.execute(
+                "ALTER TABLE track_data ADD COLUMN genres TEXT",
                 [],
             )?;
         }
@@ -602,9 +622,10 @@ impl Database {
 
     /// 曲追加データを挿入または更新
     pub fn upsert_song_add(&self, data: &TrackData) -> Result<()> {
+        let genres_str: Option<String> = data.genres.as_ref().map(|g| genres_to_string(g));
         self.conn.execute(
-            r#"INSERT INTO track_data (track, artist, duration, bpm, spotify, is_title, is_prerelease, is_aoty, is_soty)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            r#"INSERT INTO track_data (track, artist, duration, bpm, spotify, is_title, is_prerelease, is_aoty, is_soty, genres)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                ON CONFLICT(track, artist) DO UPDATE SET
                  duration = excluded.duration,
                  bpm = excluded.bpm,
@@ -612,7 +633,8 @@ impl Database {
                  is_title = excluded.is_title,
                  is_prerelease = excluded.is_prerelease,
                  is_aoty = excluded.is_aoty,
-                 is_soty = excluded.is_soty"#,
+                 is_soty = excluded.is_soty,
+                 genres = excluded.genres"#,
             params![
                 data.track,
                 data.artist,
@@ -622,7 +644,8 @@ impl Database {
                 data.is_title,
                 data.is_prerelease,
                 data.is_aoty,
-                data.is_soty
+                data.is_soty,
+                genres_str
             ],
         )?;
         Ok(())
@@ -631,10 +654,11 @@ impl Database {
     /// 曲追加データを取得
     pub fn get_song_add(&self, artist: &str, track: &str) -> Result<Option<TrackData>> {
         let result = self.conn.query_row(
-            "SELECT id, track, artist, duration, bpm, spotify, is_title, is_prerelease, is_aoty, is_soty
+            "SELECT id, track, artist, duration, bpm, spotify, is_title, is_prerelease, is_aoty, is_soty, genres
              FROM track_data WHERE artist = ?1 AND track = ?2",
             [artist, track],
             |row| {
+                let genres_str: Option<String> = row.get(10)?;
                 Ok(TrackData {
                     id: Some(row.get(0)?),
                     track: row.get(1)?,
@@ -649,6 +673,7 @@ impl Database {
                     is_prerelease: row.get(7)?,
                     is_aoty: row.get(8)?,
                     is_soty: row.get(9)?,
+                    genres: genres_str.map(|s| parse_genres(&s)),
                 })
             },
         );
@@ -663,7 +688,7 @@ impl Database {
     pub fn get_soty(&self) -> Result<Vec<TrackData>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.artist, a.label, c.date, c.album, s.track,
-                    s.duration, s.bpm, s.spotify, s.is_title, s.is_prerelease, COALESCE(s.is_aoty, 0), s.is_soty
+                    s.duration, s.bpm, s.spotify, s.is_title, s.is_prerelease, COALESCE(s.is_aoty, 0), s.is_soty, s.genres
              FROM track_data s
              LEFT JOIN artist_data a ON s.artist = a.artist
              LEFT JOIN (SELECT DISTINCT artist, track, date, album FROM credit_data) c
@@ -672,6 +697,7 @@ impl Database {
              ORDER BY c.date DESC, s.artist, s.track",
         )?;
         let rows = stmt.query_map([], |row| {
+            let genres_str: Option<String> = row.get(13)?;
             Ok(TrackData {
                 id: Some(row.get(0)?),
                 artist: row.get(1)?,
@@ -686,6 +712,7 @@ impl Database {
                 is_prerelease: row.get(10)?,
                 is_aoty: row.get(11)?,
                 is_soty: row.get(12)?,
+                genres: genres_str.map(|s| parse_genres(&s)),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -695,7 +722,7 @@ impl Database {
     pub fn get_aoty(&self) -> Result<Vec<TrackData>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.artist, a.label, c.date, c.album, s.track,
-                    s.duration, s.bpm, s.spotify, s.is_title, s.is_prerelease, s.is_aoty, COALESCE(s.is_soty, 0)
+                    s.duration, s.bpm, s.spotify, s.is_title, s.is_prerelease, s.is_aoty, COALESCE(s.is_soty, 0), s.genres
              FROM track_data s
              LEFT JOIN artist_data a ON s.artist = a.artist
              LEFT JOIN (SELECT DISTINCT artist, track, date, album FROM credit_data) c
@@ -704,6 +731,7 @@ impl Database {
              ORDER BY c.date DESC, s.artist, s.track",
         )?;
         let rows = stmt.query_map([], |row| {
+            let genres_str: Option<String> = row.get(13)?;
             Ok(TrackData {
                 id: Some(row.get(0)?),
                 artist: row.get(1)?,
@@ -718,6 +746,7 @@ impl Database {
                 is_prerelease: row.get(10)?,
                 is_aoty: row.get(11)?,
                 is_soty: row.get(12)?,
+                genres: genres_str.map(|s| parse_genres(&s)),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -728,13 +757,14 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, c.artist, a.label, c.date, c.album, c.track,
                     s.duration, s.bpm, s.spotify,
-                    COALESCE(s.is_title, 0), COALESCE(s.is_prerelease, 0), COALESCE(s.is_aoty, 0), COALESCE(s.is_soty, 0)
+                    COALESCE(s.is_title, 0), COALESCE(s.is_prerelease, 0), COALESCE(s.is_aoty, 0), COALESCE(s.is_soty, 0), s.genres
              FROM (SELECT MIN(rowid) as min_rowid, artist, track, date, album FROM credit_data GROUP BY artist, track, date, album) c
              LEFT JOIN track_data s ON c.artist = s.artist AND c.track = s.track
              LEFT JOIN artist_data a ON c.artist = a.artist
              ORDER BY COALESCE(a.sort_order, 999999), c.artist, c.date ASC, c.min_rowid ASC",
         )?;
         let rows = stmt.query_map([], |row| {
+            let genres_str: Option<String> = row.get(13)?;
             Ok(TrackData {
                 id: row.get(0)?,
                 artist: row.get(1)?,
@@ -749,9 +779,26 @@ impl Database {
                 is_prerelease: row.get(10)?,
                 is_aoty: row.get(11)?,
                 is_soty: row.get(12)?,
+                genres: genres_str.map(|s| parse_genres(&s)),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 全ジャンル名を取得（サジェスト用）
+    pub fn get_all_genres(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT genres FROM track_data WHERE genres IS NOT NULL AND genres != ''",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut genre_set = std::collections::BTreeSet::new();
+        for row in rows {
+            let genres_str = row?;
+            for g in parse_genres(&genres_str) {
+                genre_set.insert(g);
+            }
+        }
+        Ok(genre_set.into_iter().collect())
     }
 
     /// AOTYフラグを切り替え
@@ -935,7 +982,7 @@ impl Database {
     pub fn get_writers(&self) -> Result<Vec<WriterData>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, real_name, birth_date, birth_place, occupation, agency, debut, memo
-             FROM writer_data ORDER BY name",
+             FROM writer_data ORDER BY id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(WriterData {
@@ -951,6 +998,13 @@ impl Database {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// writer_dataに登録済みの全名前を取得
+    pub fn get_writer_data_names(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM writer_data")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(Into::into)
     }
 
     /// ライターを取得
@@ -1048,6 +1102,19 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Spotify URLがある曲からランダムにN件取得 (artist, track, spotify_url)
+    pub fn get_random_tracks_with_spotify(&self, count: usize) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT artist, track, spotify FROM track_data
+             WHERE spotify IS NOT NULL AND spotify != ''
+             ORDER BY RANDOM() LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([count as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     // ========== 統計 ==========

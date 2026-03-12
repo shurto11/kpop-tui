@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::models::{ArtistData, BpmArtistInfo, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData};
+use crate::models::{ArtistData, BpmArtistInfo, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
 use crate::scraper::{find_all_tracks_in_bpm_data, make_songbpm_url, make_url, scrape_genius, scrape_songbpm};
 use crate::tui::app::{App, FormField, Mode, Screen, TrackFilter};
 
@@ -83,6 +83,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             if app.screen == Screen::MainMenu {
                 // MainMenuではEscで何もしない
+            } else if matches!(app.screen, Screen::QuizResult) {
+                handle_quiz_next(app);
+            } else if matches!(app.screen, Screen::QuizFinal) {
+                app.screen_stack.clear();
+                app.go_to(Screen::MainMenu);
             } else {
                 app.go_back();
             }
@@ -135,6 +140,18 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 app.suggestion_index = 0;
                 app.input_label = "Artist".to_string();
                 if let Ok(artists) = app.db.get_artists_without_add_data() {
+                    app.suggestions = artists;
+                }
+            } else if matches!(app.screen, Screen::SearchTrack | Screen::Quiz) && !app.current_artist.is_empty() {
+                // SearchTrack/QuizでTrack選択中 → Artist選択に戻る
+                app.current_artist.clear();
+                app.suggestion_index = 0;
+                app.selecting_suggestion = false;
+                app.input_buffer.clear();
+                app.input_cursor = 0;
+                app.input_label = "Artist".to_string();
+                app.mode = Mode::Insert;
+                if let Ok(artists) = app.db.get_all_artists() {
                     app.suggestions = artists;
                 }
             } else if app.screen != Screen::MainMenu {
@@ -314,6 +331,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             }
         }
 
+        // Quiz: パス（不正解扱い）
+        KeyCode::Char('p') => {
+            if matches!(app.screen, Screen::Quiz) && !app.quiz_questions.is_empty() {
+                handle_quiz_pass(app);
+            }
+        }
+
         // WriterAka: スペースでAkaトグル
         KeyCode::Char(' ') => {
             if matches!(app.screen, Screen::InputWriterAka) {
@@ -331,6 +355,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                     | Screen::InputTrackData
                     | Screen::SearchWriter
                     | Screen::SearchTrack
+                    | Screen::Quiz
             ) {
                 app.mode = Mode::Insert;
             }
@@ -374,9 +399,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 // アーティスト・トラックを設定してフォーム画面へ直接遷移
                 app.current_artist = t.artist.clone();
                 app.current_track = t.track.clone();
+                // SOTY/AOTY を保持
+                app.edit_is_soty = t.is_soty;
+                app.edit_is_aoty = t.is_aoty;
                 let dur = t.duration.map(|d| d.to_string()).unwrap_or_default();
                 let spotify = t.spotify.unwrap_or_default();
                 let release_idx = if t.is_title { 1 } else if t.is_prerelease { 2 } else { 0 };
+                let existing_genres = t.genres.as_ref().map(|g| genres_to_string(g)).unwrap_or_default();
                 let bpm_field = if let Some(ref b) = t.bpm {
                     if let Ok(n) = b.parse::<i64>() {
                         let half = n / 2;
@@ -397,9 +426,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                     bpm_field,
                     FormField::with_value("Spotify URL", &spotify),
                     FormField::select("Release", vec!["-", "Title", "Pre"], release_idx),
+                    FormField::with_value("Genre", &existing_genres),
                 ];
                 app.form_index = 0;
                 app.mode = Mode::Normal;
+                app.suggestions.clear();
             }
         }
 
@@ -1045,10 +1076,60 @@ fn handle_suggestion_select(app: &mut App, key: KeyEvent) {
 
         // 選択確定: 候補を入力欄に反映してノーマルモードに戻る
         KeyCode::Char('l') | KeyCode::Enter => {
-            if let Some(suggestion) = app.suggestions.get(app.suggestion_index) {
+            if matches!(app.screen, Screen::SearchTrack | Screen::Quiz) {
+                // SearchTrack/Quiz: Suggestionsから直接遷移
+                if let Some(suggestion) = app.suggestions.get(app.suggestion_index).cloned() {
+                    if app.current_artist.is_empty() {
+                        // Artist選択 → Track選択へ（入力欄なし、Suggestions直接表示）
+                        app.current_artist = suggestion.clone();
+                        app.input_buffer.clear();
+                        app.input_cursor = 0;
+                        app.input_label = "Track".to_string();
+                        if let Ok(tracks) = app.db.get_tracks_by_artist(&suggestion) {
+                            app.suggestions = tracks;
+                        }
+                        app.suggestion_index = 0;
+                        // Suggestions選択モードのまま維持
+                        return;
+                    } else {
+                        if matches!(app.screen, Screen::Quiz) {
+                            // Quiz: Track選択 → 回答チェック
+                            let answered_track = suggestion;
+                            let answered_artist = app.current_artist.clone();
+                            app.current_artist.clear();
+                            app.selecting_suggestion = false;
+                            app.mode = Mode::Normal;
+                            handle_quiz_answer(app, &answered_artist, &answered_track);
+                            return;
+                        }
+                        // Track選択 → SearchTrackResultへ遷移
+                        let artist = app.current_artist.clone();
+                        app.current_artist.clear();
+                        app.selecting_suggestion = false;
+                        app.mode = Mode::Normal;
+                        app.go_to(Screen::SearchTrackResult { artist, track: suggestion });
+                        return;
+                    }
+                }
+            } else if let Some(suggestion) = app.suggestions.get(app.suggestion_index) {
                 if !app.form_fields.is_empty() {
-                    app.form_fields[app.form_index].value = suggestion.clone();
-                    app.form_fields[app.form_index].cursor = suggestion.chars().count();
+                    // Genreフィールド: 最後のトークンだけ置換
+                    if matches!(app.screen, Screen::InputTrackData) && app.form_index == 4 {
+                        let field = &mut app.form_fields[app.form_index];
+                        let parts: Vec<&str> = field.value.split(',').collect();
+                        let mut new_parts: Vec<String> = parts[..parts.len().saturating_sub(1)]
+                            .iter()
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                        new_parts.push(suggestion.clone());
+                        let new_value = format!("{}, ", new_parts.join(", "));
+                        field.cursor = new_value.chars().count();
+                        field.value = new_value;
+                    } else {
+                        app.form_fields[app.form_index].value = suggestion.clone();
+                        app.form_fields[app.form_index].cursor = suggestion.chars().count();
+                    }
                 } else {
                     app.input_buffer = suggestion.clone();
                     app.input_cursor = suggestion.chars().count();
@@ -1155,13 +1236,22 @@ fn is_in_form_mode(app: &App) -> bool {
 fn is_suggestion_screen(screen: &Screen) -> bool {
     matches!(
         screen,
-        Screen::InputTrackData | Screen::SearchTrack | Screen::SearchWriter
+        Screen::InputTrackData | Screen::SearchTrack | Screen::SearchWriter | Screen::Quiz
     )
 }
 
 /// l/→ でインサートモードに入る、またはメニュー選択
 fn handle_enter_insert_or_select(app: &mut App) {
-    if is_menu_screen(&app.screen) {
+    if matches!(app.screen, Screen::QuizResult) {
+        // QuizResult: 次の問題へ（最終問ならQuizFinalへ）
+        handle_quiz_next(app);
+        return;
+    } else if matches!(app.screen, Screen::QuizFinal) {
+        // QuizFinal: メニューへ戻る
+        app.screen_stack.clear();
+        app.go_to(Screen::MainMenu);
+        return;
+    } else if is_menu_screen(&app.screen) {
         // メニュー画面: 選択して遷移
         if let Some(item) = app.menu_items.get(app.menu_index) {
             let screen = item.screen.clone();
@@ -1208,11 +1298,20 @@ fn handle_enter_insert_or_select(app: &mut App) {
 
 /// 選択を実行（Enter）
 fn handle_select(app: &mut App) {
-    if is_menu_screen(&app.screen) {
+    if matches!(app.screen, Screen::QuizResult) {
+        handle_quiz_next(app);
+        return;
+    } else if matches!(app.screen, Screen::QuizFinal) {
+        app.screen_stack.clear();
+        app.go_to(Screen::MainMenu);
+        return;
+    } else if is_menu_screen(&app.screen) {
         if let Some(item) = app.menu_items.get(app.menu_index) {
             let screen = item.screen.clone();
             app.go_to(screen);
         }
+    } else if matches!(app.screen, Screen::SearchTrack) {
+        // SearchTrack: NormalモードのEnterでは遷移しない（Suggestionsからのみ）
     } else if is_form_screen(&app.screen) || is_suggestion_screen(&app.screen) {
         // フォーム画面・補完候補画面: 確定処理
         handle_confirm(app);
@@ -1358,8 +1457,8 @@ fn handle_confirm(app: &mut App) {
             }
         }
 
-        Screen::SearchTrack => {
-            // 2段階入力: まずArtist、次にTrack
+        Screen::SearchTrack | Screen::Quiz => {
+            // Artist入力 → Enterで確定してTrack選択(Suggestions)へ
             if app.current_artist.is_empty() {
                 let artist = app.input_buffer.trim().to_string();
                 if !artist.is_empty() {
@@ -1367,20 +1466,14 @@ fn handle_confirm(app: &mut App) {
                     app.input_buffer.clear();
                     app.input_cursor = 0;
                     app.input_label = "Track".to_string();
-
-                    // 曲の補完候補を更新
                     if let Ok(tracks) = app.db.get_tracks_by_artist(&artist) {
                         app.suggestions = tracks;
                     }
-                }
-            } else {
-                let track = app.input_buffer.trim().to_string();
-                if !track.is_empty() {
-                    let artist = app.current_artist.clone();
-                    app.current_artist.clear();
-                    app.go_to(Screen::SearchTrackResult { artist, track });
+                    app.suggestion_index = 0;
+                    app.selecting_suggestion = true;
                 }
             }
+            // Track選択はSuggestionsのEnterで処理（handle_confirmには来ない）
         }
 
         Screen::InputTrackData => {
@@ -1400,6 +1493,15 @@ fn handle_confirm(app: &mut App) {
                     .unwrap_or_default();
                 let is_title = release == "title";
                 let is_prerelease = release == "pre";
+                // Genreフィールドの解析
+                let genres_str = app.form_fields.get(4)
+                    .map(|f| f.value.trim().to_string())
+                    .unwrap_or_default();
+                let genres = if genres_str.is_empty() {
+                    None
+                } else {
+                    Some(parse_genres(&genres_str))
+                };
 
                 let data = TrackData {
                     id: None,
@@ -1413,8 +1515,9 @@ fn handle_confirm(app: &mut App) {
                     spotify,
                     is_title,
                     is_prerelease,
-                    is_aoty: false,
-                    is_soty: false,
+                    is_aoty: app.edit_is_aoty,
+                    is_soty: app.edit_is_soty,
+                    genres,
                 };
 
                 match app.db.upsert_song_add(&data) {
@@ -1542,8 +1645,23 @@ fn handle_tab(app: &mut App, reverse: bool) {
         // 選択した候補を入力欄に反映
         if let Some(suggestion) = app.suggestions.get(app.suggestion_index) {
             if !app.form_fields.is_empty() {
-                app.form_fields[app.form_index].value = suggestion.clone();
-                app.form_fields[app.form_index].cursor = suggestion.chars().count();
+                // Genreフィールド: 最後のトークンだけ置換
+                if matches!(app.screen, Screen::InputTrackData) && app.form_index == 4 {
+                    let field = &mut app.form_fields[app.form_index];
+                    let parts: Vec<&str> = field.value.split(',').collect();
+                    let mut new_parts: Vec<String> = parts[..parts.len().saturating_sub(1)]
+                        .iter()
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                    new_parts.push(suggestion.clone());
+                    let new_value = format!("{}, ", new_parts.join(", "));
+                    field.cursor = new_value.chars().count();
+                    field.value = new_value;
+                } else {
+                    app.form_fields[app.form_index].value = suggestion.clone();
+                    app.form_fields[app.form_index].cursor = suggestion.chars().count();
+                }
             } else {
                 app.input_buffer = suggestion.clone();
                 app.input_cursor = suggestion.chars().count();
@@ -1580,9 +1698,28 @@ fn parse_duration(s: &str) -> Option<i64> {
 
 /// 補完候補を更新
 fn update_suggestions(app: &mut App) {
-    // InputTrackDataのフォーム表示中はサジェスト不要
+    // InputTrackDataのフォーム表示中: Genreフィールド(index=4)のみサジェスト
     if matches!(app.screen, Screen::InputTrackData) && !app.form_fields.is_empty() {
-        app.suggestions.clear();
+        if app.form_index == 4 {
+            // Genreフィールド: 最後のカンマ以降のトークンで前方一致フィルタ
+            let value = app.form_fields[4].value.clone();
+            let last_token = value.rsplit(',').next().unwrap_or("").trim().to_lowercase();
+            let all_genres = app.db.get_all_genres().unwrap_or_default();
+            // 既に入力済みのジャンルを除外
+            let existing: Vec<String> = parse_genres(&value);
+            if last_token.is_empty() {
+                app.suggestions = all_genres.into_iter()
+                    .filter(|g| !existing.contains(g))
+                    .collect();
+            } else {
+                app.suggestions = all_genres.into_iter()
+                    .filter(|g| g.to_lowercase().starts_with(&last_token) && !existing.iter().any(|e| e.to_lowercase() == g.to_lowercase()))
+                    .collect();
+            }
+            app.suggestion_index = 0;
+        } else {
+            app.suggestions.clear();
+        }
         return;
     }
 
@@ -1595,7 +1732,7 @@ fn update_suggestions(app: &mut App) {
     if input.is_empty() {
         // 全候補を表示
         match &app.screen {
-            Screen::InputTrackData | Screen::SearchTrack => {
+            Screen::InputTrackData | Screen::SearchTrack | Screen::Quiz => {
                 if app.current_artist.is_empty() {
                     app.suggestions = app.db.get_all_artists().unwrap_or_default();
                 } else {
@@ -1642,7 +1779,7 @@ fn update_suggestions(app: &mut App) {
     // 入力に基づいて候補をフィルタ（先頭一致）
     let input_lower = input.to_lowercase();
     match &app.screen {
-        Screen::InputTrackData | Screen::SearchTrack => {
+        Screen::InputTrackData | Screen::SearchTrack | Screen::Quiz => {
             if app.current_artist.is_empty() {
                 // アーティスト候補
                 let all_artists = app.db.get_all_artists().unwrap_or_default();
@@ -1761,6 +1898,11 @@ fn handle_open_spotify(app: &mut App) {
         // SearchTrackResult / MainMenu: search_track_dataからSpotify URLを取得
         app.search_track_data.as_ref()
             .and_then(|td| td.spotify.clone())
+            .filter(|s| !s.is_empty())
+    } else if matches!(app.screen, Screen::Quiz) {
+        // Quiz: 現在の問題のSpotify URL
+        app.quiz_questions.get(app.quiz_current)
+            .map(|(_, _, url)| url.clone())
             .filter(|s| !s.is_empty())
     } else if matches!(app.screen, Screen::SearchWriterResult { .. }) {
         // SearchWriterResult: カーソル位置の曲のSpotify URLをtrack_dataから取得
@@ -1918,6 +2060,14 @@ fn setup_track_form(app: &mut App, dur: &str, bpm: Option<String>, spotify: &str
         FormField::new("BPM")
     };
 
+    // 既存のgenresを取得
+    let existing_genres = app.db.get_song_add(&app.current_artist, &app.current_track)
+        .ok()
+        .flatten()
+        .and_then(|td| td.genres)
+        .map(|g| genres_to_string(&g))
+        .unwrap_or_default();
+
     // Track名はフォーム上部の表示専用ヘッダー
     app.form_header = bpm_track_name.to_string();
 
@@ -1926,6 +2076,7 @@ fn setup_track_form(app: &mut App, dur: &str, bpm: Option<String>, spotify: &str
         bpm_field,
         FormField::with_value("Spotify URL", spotify),
         FormField::select("Release", vec!["-", "Title", "Pre"], 0),
+        FormField::with_value("Genre", &existing_genres),
     ];
     app.form_index = 0;
     app.mode = Mode::Normal;
@@ -2021,6 +2172,179 @@ fn handle_writer_aka_toggle(app: &mut App) {
             }
             Err(e) => app.show_error(&format!("Failed: {}", e)),
         }
+    }
+}
+
+/// Quiz: 回答チェック
+fn handle_quiz_answer(app: &mut App, answered_artist: &str, answered_track: &str) {
+    if let Some((correct_artist, correct_track, _)) = app.quiz_questions.get(app.quiz_current).cloned() {
+        let is_correct = answered_artist == correct_artist && answered_track == correct_track;
+        if is_correct {
+            app.quiz_score += 1;
+        }
+        app.quiz_last_correct = is_correct;
+        app.quiz_last_answer = format!("{} - {}", answered_artist, answered_track);
+        app.quiz_last_actual = format!("{} - {}", correct_artist, correct_track);
+        // QuizResult画面へ（go_toを使わずscreen直接変更してQuiz状態を保持）
+        app.screen = Screen::QuizResult;
+        app.mode = Mode::Normal;
+        app.suggestions.clear();
+        app.input_buffer.clear();
+        app.input_cursor = 0;
+        // 正解曲のTrackData/Art/Creditsをロード
+        load_quiz_result_data(app, &correct_artist, &correct_track);
+        // 次の問題の曲を先に再生開始
+        quiz_auto_play_next(app);
+    }
+}
+
+/// Quiz: パス（不正解扱い）
+fn handle_quiz_pass(app: &mut App) {
+    if let Some((correct_artist, correct_track, _)) = app.quiz_questions.get(app.quiz_current).cloned() {
+        app.quiz_last_correct = false;
+        app.quiz_last_answer = "Pass".to_string();
+        app.quiz_last_actual = format!("{} - {}", correct_artist, correct_track);
+        app.screen = Screen::QuizResult;
+        app.mode = Mode::Normal;
+        app.suggestions.clear();
+        app.input_buffer.clear();
+        app.input_cursor = 0;
+        app.current_artist.clear();
+        // 正解曲のTrackData/Art/Creditsをロード
+        load_quiz_result_data(app, &correct_artist, &correct_track);
+        // 次の問題の曲を先に再生開始
+        quiz_auto_play_next(app);
+    }
+}
+
+/// Quiz: 次の問題へ（最終問ならQuizFinalへ）
+fn handle_quiz_next(app: &mut App) {
+    app.quiz_current += 1;
+    if app.quiz_current >= app.quiz_questions.len() {
+        // 全問終了 → QuizFinal
+        app.screen = Screen::QuizFinal;
+        app.mode = Mode::Normal;
+    } else {
+        // 次の問題
+        app.screen = Screen::Quiz;
+        app.mode = Mode::Insert;
+        app.current_artist.clear();
+        app.input_buffer.clear();
+        app.input_cursor = 0;
+        app.input_label = "Artist".to_string();
+        if let Ok(artists) = app.db.get_all_artists() {
+            app.suggestions = artists;
+        }
+        app.suggestion_index = 0;
+        app.selecting_suggestion = false;
+        // Spotifyは既にQuizResult画面で再生開始済み
+    }
+}
+
+/// Quiz: 正解曲のTrackData/Art/Creditsをロード
+fn load_quiz_result_data(app: &mut App, artist: &str, track: &str) {
+    app.search_track_data = app.db.get_song_add(artist, track).unwrap_or(None);
+    app.search_artist_label = app.db.get_artist(artist).ok().flatten().and_then(|a| a.label);
+    app.search_results = app.db.search_song(artist, track).unwrap_or_default();
+    app.list_index = 0;
+    app.list_offset = 0;
+
+    // アルバムアート取得
+    app.album_art_current = None;
+    if let Some(ref td) = app.search_track_data {
+        if let Some(ref url) = td.spotify {
+            if !url.is_empty() {
+                if let Some(cached) = app.album_art_cache.get(url) {
+                    app.album_art_current = Some(cached.clone());
+                } else {
+                    let url_clone = url.clone();
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = crate::scraper::fetch_album_art_ascii(&url_clone, 20, 10);
+                        let _ = tx.send(match result {
+                            Ok(lines) => Ok((url_clone, lines)),
+                            Err(e) => Err(e.to_string()),
+                        });
+                    });
+                    app.album_art_receiver = Some(rx);
+                }
+            }
+        }
+    }
+}
+
+/// Quiz: 次の問題の曲を先行再生（QuizResult表示時に呼ぶ）
+fn quiz_auto_play_next(app: &mut App) {
+    let next = app.quiz_current + 1;
+    if next >= app.quiz_questions.len() {
+        return; // 最終問なので次の曲なし
+    }
+    if let Some((_, _, ref url)) = app.quiz_questions.get(next) {
+        if !url.is_empty() {
+            let url_clone = url.clone();
+            start_spotify_play(app, &url_clone);
+        }
+    }
+}
+
+/// Quiz: Spotify自動再生（現在の問題）
+pub fn quiz_auto_play(app: &mut App) {
+    if let Some((_, _, ref url)) = app.quiz_questions.get(app.quiz_current) {
+        if !url.is_empty() {
+            // 同じURLなら何もしない
+            if *url == app.spotify_url && app.spotify_playing {
+                return;
+            }
+            let url_clone = url.clone();
+            start_spotify_play(app, &url_clone);
+        }
+    }
+}
+
+/// Spotify再生を開始（共通処理）
+fn start_spotify_play(app: &mut App, url: &str) {
+    // stop & start
+    let _ = std::process::Command::new("pkill").args(["-f", "spotify-play"]).output();
+    let _ = std::process::Command::new("pkill").args(["-f", "chrome.*chrome-data[^-]"]).output();
+    app.spotify_playing = false;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = std::fs::remove_file(SPOTIFY_CMD_FILE);
+    let _ = std::fs::remove_file(SPOTIFY_STATUS_FILE);
+
+    let url_owned = url.to_string();
+    match std::process::Command::new("xvfb-run")
+        .args(["--auto-servernum", "npx", "tsx", "spotify-play.ts", &url_owned])
+        .current_dir(dirs::home_dir().unwrap_or_default().join("ssbrowse"))
+        .env("PULSE_SERVER", "/run/user/1000/pulse/native")
+        .env("XDG_RUNTIME_DIR", "/run/user/1000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => {
+            app.spotify_url = url_owned.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.spotify_receiver = Some(rx);
+            std::thread::spawn(move || {
+                for _ in 0..600 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if let Ok(status) = std::fs::read_to_string(SPOTIFY_STATUS_FILE) {
+                        let status = status.trim().to_string();
+                        if !status.is_empty() {
+                            let _ = std::fs::remove_file(SPOTIFY_STATUS_FILE);
+                            if status.starts_with("Playing") || status.starts_with("Already playing") {
+                                let _ = tx.send(Ok(status));
+                            } else {
+                                let _ = tx.send(Err(status));
+                            }
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(Err("Spotify timeout".to_string()));
+            });
+        }
+        Err(_) => {}
     }
 }
 

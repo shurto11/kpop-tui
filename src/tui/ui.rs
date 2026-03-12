@@ -7,10 +7,28 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
+use chrono::{Datelike, Local, NaiveDate};
 use crate::tui::app::{App, Mode, Screen};
 
 /// AOTY/SOTY用の金色
 const GOLD: Color = Color::Rgb(255, 215, 0);
+
+/// 誕生日文字列から年齢を計算
+fn calc_age(birth: &str) -> Option<i32> {
+    // "YYYY-M-D" or "YYYY-MM-DD"
+    let parts: Vec<&str> = birth.split('-').collect();
+    if parts.len() != 3 { return None; }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    let bd = NaiveDate::from_ymd_opt(y, m, d)?;
+    let today = Local::now().date_naive();
+    let mut age = today.year() - bd.year();
+    if (today.month(), today.day()) < (bd.month(), bd.day()) {
+        age -= 1;
+    }
+    Some(age)
+}
 
 /// 文字列の先頭からchar_count文字分の表示幅を計算
 fn display_width_up_to(s: &str, char_count: usize) -> u16 {
@@ -131,6 +149,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Screen::ViewTrackData => "View > TrackData",
         Screen::ViewArtistData => "View > ArtistData",
         Screen::ViewWriterData => "View > WriterData",
+        Screen::Quiz => {
+            let q = app.quiz_current + 1;
+            let total = app.quiz_questions.len();
+            let score = app.quiz_score;
+            return draw_quiz_header(frame, q, total, score, app.mode, area);
+        }
+        Screen::QuizResult => {
+            let q = app.quiz_current + 1;
+            let total = app.quiz_questions.len();
+            let score = app.quiz_score;
+            return draw_quiz_header(frame, q, total, score, app.mode, area);
+        }
+        Screen::QuizFinal => "Quiz > Result",
     };
 
     let mode_str = match app.mode {
@@ -195,7 +226,12 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         Screen::SearchTrack => {
-            draw_input_with_suggestions(frame, app, area);
+            if !app.current_artist.is_empty() {
+                // Track選択: 入力欄なし、Suggestionsのみ
+                draw_suggestions_with_title(frame, app, area, &format!("{} > Track", app.current_artist));
+            } else {
+                draw_input_with_suggestions(frame, app, area);
+            }
         }
         Screen::SearchWriter => {
             draw_simple_input(frame, app, area);
@@ -217,6 +253,19 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Screen::SearchTrackResult { .. } => {
             draw_song_result(frame, app, area);
+        }
+        Screen::Quiz => {
+            if !app.current_artist.is_empty() {
+                draw_suggestions_with_title(frame, app, area, &format!("{} > Track", app.current_artist));
+            } else {
+                draw_input_with_suggestions(frame, app, area);
+            }
+        }
+        Screen::QuizResult => {
+            draw_quiz_result(frame, app, area);
+        }
+        Screen::QuizFinal => {
+            draw_quiz_final(frame, app, area);
         }
     }
 }
@@ -302,6 +351,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Screen::SearchTrackResult { .. } => {
                     "j/k: Move  l: Writer  c: Play  x: Pause  /: Search  h: Back  q: Menu  Q: Quit"
                 }
+                Screen::Quiz => {
+                    "i: Insert  Tab: Suggestions  p: Pass  c: Play  h/Esc: Back  q: Menu"
+                }
+                Screen::QuizResult => {
+                    "Enter/l: Next  Esc: Next  q: Menu"
+                }
+                Screen::QuizFinal => {
+                    "Enter/Esc: Menu"
+                }
             }
         }
         Mode::Insert => {
@@ -359,12 +417,12 @@ fn draw_main_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // 曲名バー(高さ3: ボーダー2+テキスト1) + Track情報(高さ12) + メニュー(残り)
+    // 曲名バー(高さ3: ボーダー2+テキスト1) + Track情報(高さ13) + メニュー(残り)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),   // Random Track タイトルバー
-            Constraint::Length(12),  // Track情報(Art + TrackData + Around-The-Day)
+            Constraint::Length(13),  // Track情報(Art + TrackData + Around-The-Day)
             Constraint::Min(0),     // メニュー
         ])
         .split(area);
@@ -395,8 +453,8 @@ fn draw_main_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(22), // Album: 20文字 + ボーダー2
-            Constraint::Length(30), // TrackData
-            Constraint::Min(0),     // Around-The-Day Drops
+            Constraint::Fill(1),    // TrackData (均等)
+            Constraint::Fill(1),    // Around-The-Day Drops (均等)
         ])
         .split(chunks[1]);
 
@@ -735,6 +793,48 @@ fn draw_suggestions_only(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+/// タイトル付きSuggestions表示（SearchTrackのTrack選択用）
+fn draw_suggestions_with_title(frame: &mut Frame, app: &App, area: Rect, title: &str) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = app.suggestions.len();
+    let idx = app.suggestion_index;
+
+    let offset = if visible == 0 || total <= visible {
+        0
+    } else if idx < visible / 2 {
+        0
+    } else if idx + visible / 2 >= total {
+        total - visible
+    } else {
+        idx - visible / 2
+    };
+    let end = (offset + visible).min(total);
+
+    let items: Vec<ListItem> = app.suggestions[offset..end]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let actual = offset + i;
+            let style = if actual == idx {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let prefix = if actual == idx { "> " } else { "  " };
+            ListItem::new(format!("{}{}", prefix, s)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string())
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    frame.render_widget(list, area);
+}
+
 /// WriterAka画面描画（単語一致ペアの自動検出リスト）
 fn draw_writer_aka(frame: &mut Frame, app: &App, area: Rect) {
     if app.aka_pairs.is_empty() {
@@ -920,6 +1020,14 @@ fn draw_song_add_form(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
+
+    // Genreフィールド(index=4)でサジェスト表示
+    if app.form_index == 4 && !app.suggestions.is_empty()
+        && (app.mode == Mode::Insert || app.selecting_suggestion)
+    {
+        let remaining_area = chunks.last().copied().unwrap_or(area);
+        draw_suggestions(frame, app, remaining_area);
+    }
 }
 
 /// 曲テーブル
@@ -956,7 +1064,15 @@ fn draw_song_table(frame: &mut Frame, app: &App, area: Rect) {
                 album_cell,
                 track_cell,
                 Cell::from(role_str.clone()).style(Style::default().fg(role_color(&role_str))),
-                Cell::from(song.name.clone().unwrap_or_default()),
+                {
+                    let name = song.name.clone().unwrap_or_default();
+                    let s = if app.writer_data_names.contains(&name) {
+                        Style::default().fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+                    Cell::from(name).style(s)
+                },
                 Cell::from(song.count.map(|c| c.to_string()).unwrap_or_default()),
             ])
             .style(style)
@@ -1223,7 +1339,7 @@ fn draw_writer_table(frame: &mut Frame, app: &App, area: Rect) {
 
 /// TrackDataテーブル
 fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Dur", "BPM", "Spotify", "Rel", "AOTY", "SOTY"])
+    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Sp", "Rel", "A", "S"])
         .style(Style::default().add_modifier(Modifier::BOLD))
         .height(1);
 
@@ -1258,12 +1374,16 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Cell::from(track.track.clone())
             };
+            let genre_display = track.genres.as_ref()
+                .map(|g| crate::models::genres_display(g))
+                .unwrap_or_default();
             Row::new(vec![
                 Cell::from(track.artist.clone()),
                 Cell::from(track.label.clone().unwrap_or_default()),
                 Cell::from(track.date.clone().unwrap_or_default()),
                 album_cell,
                 track_cell,
+                Cell::from(genre_display),
                 Cell::from(duration),
                 Cell::from(track.bpm.clone().unwrap_or_default()),
                 Cell::from(if track.spotify.as_ref().map_or(false, |s| !s.is_empty()) { "#".to_string() } else { String::new() }),
@@ -1278,17 +1398,18 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(12), // Artist
-            Constraint::Percentage(8),  // Label
-            Constraint::Percentage(10), // Date
-            Constraint::Percentage(12), // Album
-            Constraint::Percentage(17), // Track
-            Constraint::Percentage(6),  // Duration
+            Constraint::Percentage(11), // Artist
+            Constraint::Percentage(7),  // Label
+            Constraint::Percentage(9),  // Date
+            Constraint::Percentage(11), // Album
+            Constraint::Percentage(15), // Track
+            Constraint::Percentage(12), // Genre
+            Constraint::Percentage(5),  // Duration
             Constraint::Percentage(5),  // BPM
-            Constraint::Percentage(10), // Spotify
-            Constraint::Percentage(6),  // Release
-            Constraint::Percentage(7),  // AOTY
-            Constraint::Percentage(7),  // SOTY
+            Constraint::Percentage(3),  // Spotify
+            Constraint::Percentage(5),  // Release
+            Constraint::Percentage(4),  // AOTY
+            Constraint::Percentage(4),  // SOTY
         ],
     )
     .header(header)
@@ -1330,7 +1451,10 @@ fn draw_writer_result(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut lines = Vec::new();
         lines.push(format!("Name: {}", wd.name));
         if let Some(ref v) = wd.real_name { lines.push(format!("Real Name: {}", v)); }
-        if let Some(ref v) = wd.birth_date { lines.push(format!("Birth Date: {}", v)); }
+        if let Some(ref v) = wd.birth_date {
+            let age_str = calc_age(v).map_or(String::new(), |a| format!(" ({})", a));
+            lines.push(format!("Birth Date: {}{}", v, age_str));
+        }
         if let Some(ref v) = wd.birth_place { lines.push(format!("Birth Place: {}", v)); }
         if let Some(ref v) = wd.occupation { lines.push(format!("Occupation: {}", v)); }
         if let Some(ref v) = wd.agency { lines.push(format!("Agency: {}", v)); }
@@ -1483,6 +1607,9 @@ fn draw_track_data_vertical(frame: &mut Frame, td: &crate::models::TrackData, cr
     let aoty = if td.is_aoty { "*" } else { "-" };
     let soty = if td.is_soty { "*" } else { "-" };
     let spotify = if td.spotify.as_ref().map_or(false, |s| !s.is_empty()) { "#" } else { "" };
+    let genre_display = td.genres.as_ref()
+        .map(|g| crate::models::genres_display(g))
+        .unwrap_or_default();
 
     let lines = vec![
         Line::from(vec![
@@ -1496,6 +1623,10 @@ fn draw_track_data_vertical(frame: &mut Frame, td: &crate::models::TrackData, cr
         Line::from(vec![
             Span::styled("Date:  ", Style::default().fg(Color::DarkGray)),
             Span::raw(date),
+        ]),
+        Line::from(vec![
+            Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&genre_display),
         ]),
         Line::from(vec![
             Span::styled("Dur:   ", Style::default().fg(Color::DarkGray)),
@@ -1537,7 +1668,7 @@ fn draw_track_data_vertical(frame: &mut Frame, td: &crate::models::TrackData, cr
 /// Song検索結果
 fn draw_song_result(frame: &mut Frame, app: &mut App, area: Rect) {
     // 常に固定レイアウト: 上部(Album + TrackData) + 下部(Credits)
-    let top_height: u16 = 12; // 10行 + ボーダー2行
+    let top_height: u16 = 13; // 11行 + ボーダー2行
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1552,8 +1683,8 @@ fn draw_song_result(frame: &mut Frame, app: &mut App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(22), // Album: 20文字 + ボーダー2
-            Constraint::Length(30), // TrackData
-            Constraint::Min(0),     // Around-The-Day Drops
+            Constraint::Fill(1),    // TrackData (均等)
+            Constraint::Fill(1),    // Around-The-Day Drops (均等)
         ])
         .split(chunks[0]);
 
@@ -1618,9 +1749,15 @@ fn draw_song_result(frame: &mut Frame, app: &mut App, area: Rect) {
             let actual_index = app.list_offset + i;
             let style = row_style(app, actual_index);
             let role_str = song.role.clone().unwrap_or_default();
+            let name = song.name.clone().unwrap_or_default();
+            let name_style = if app.writer_data_names.contains(&name) {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 Cell::from(role_str.clone()).style(Style::default().fg(role_color(&role_str))),
-                Cell::from(song.name.clone().unwrap_or_default()),
+                Cell::from(name).style(name_style),
                 Cell::from(song.count.map(|c| c.to_string()).unwrap_or_default()),
             ])
             .style(style)
@@ -1709,6 +1846,169 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     let g6 = ((g as u16 * 5 + 127) / 255) as u8;
     let b6 = ((b as u16 * 5 + 127) / 255) as u8;
     16 + 36 * r6 + 6 * g6 + b6
+}
+
+/// Quizヘッダー
+fn draw_quiz_header(frame: &mut Frame, question: usize, total: usize, score: usize, mode: Mode, area: Rect) {
+    let mode_str = match mode {
+        Mode::Normal => "[NORMAL]",
+        Mode::Insert => "[INSERT]",
+        Mode::Search => "[SEARCH]",
+        Mode::Visual => "[VISUAL]",
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("Quiz", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!(" ({}/{})  ", question, total)),
+        Span::styled(format!("Score: {}", score), Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled(mode_str, Style::default().fg(Color::Yellow)),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, area);
+}
+
+/// Quiz正誤結果画面
+fn draw_quiz_result(frame: &mut Frame, app: &mut App, area: Rect) {
+    // 上: Result(全幅)  下: Art + TrackData
+    let result_height: u16 = if app.quiz_last_correct { 5 } else { 6 };
+    let art_height: u16 = 12;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(result_height),
+            Constraint::Length(art_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    // Result（正誤表示）全幅
+    let mark = if app.quiz_last_correct { "O" } else { "X" };
+    let mark_color = if app.quiz_last_correct { Color::Green } else { Color::Red };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(mark, Style::default().fg(mark_color).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled("Score: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} / {}", app.quiz_score, app.quiz_current + 1),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    if !app.quiz_last_correct {
+        lines.push(Line::from(vec![
+            Span::styled("  Your Answer: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&app.quiz_last_answer, Style::default().fg(Color::Red)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("  Correct:     ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&app.quiz_last_actual, Style::default().fg(Color::Green)),
+    ]));
+
+    let result_block = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Result"));
+    frame.render_widget(result_block, chunks[0]);
+
+    // 横分割: Art(22) + TrackData(残り)
+    let bottom_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(22),
+            Constraint::Min(0),
+        ])
+        .split(chunks[1]);
+
+    // Album Art
+    if let Some(ref art_lines) = app.album_art_current {
+        let art_text: Vec<Line> = art_lines.iter().map(|row| {
+            let spans: Vec<Span> = row.iter().map(|&(ch, r, g, b)| {
+                Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(Color::Indexed(rgb_to_256(r, g, b))),
+                )
+            }).collect();
+            Line::from(spans)
+        }).collect();
+        let art = Paragraph::new(art_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Art")
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+        frame.render_widget(art, bottom_chunks[0]);
+    } else {
+        draw_art_placeholder(frame, app, bottom_chunks[0]);
+    }
+
+    // TrackData
+    if let Some(ref td) = app.search_track_data {
+        draw_track_data_vertical(frame, td, app.search_results.first(), app.search_artist_label.as_deref(), bottom_chunks[1]);
+    } else {
+        let empty = Block::default()
+            .borders(Borders::ALL)
+            .title("TrackData")
+            .border_style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, bottom_chunks[1]);
+    }
+}
+
+/// Quiz最終結果画面
+fn draw_quiz_final(frame: &mut Frame, app: &App, area: Rect) {
+    let total = app.quiz_questions.len();
+    let score = app.quiz_score;
+    let pct = if total > 0 { score * 100 / total } else { 0 };
+
+    let grade = match pct {
+        90..=100 => ("S", Color::Rgb(255, 215, 0)),
+        80..=89 => ("A", Color::Green),
+        70..=79 => ("B", Color::Cyan),
+        60..=69 => ("C", Color::Yellow),
+        _ => ("D", Color::Red),
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Final Score: {} / {}", score, total),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Grade: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(grade.0, Style::default().fg(grade.1).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press Enter or Esc to return to menu",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    // 全問の結果一覧を表示
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Questions:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for (i, (artist, track, _)) in app.quiz_questions.iter().enumerate() {
+        let answered = i < app.quiz_current + 1; // quiz_currentは0-indexedで最後の問題のインデックス
+        if !answered { break; }
+        let prefix = format!("  {}. ", i + 1);
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{} - {}", artist, track)),
+        ]));
+    }
+
+    let block = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Quiz Complete"));
+    frame.render_widget(block, area);
 }
 
 /// サジェスチョンを表示すべきかどうか

@@ -52,6 +52,7 @@ pub struct TrackData {
     pub is_prerelease: bool,
     pub is_aoty: bool,
     pub is_soty: bool,
+    pub genres: Option<Vec<String>>,
 }
 
 impl TrackData {
@@ -70,8 +71,24 @@ impl TrackData {
             is_prerelease: false,
             is_aoty: false,
             is_soty: false,
+            genres: None,
         }
     }
+}
+
+/// genres文字列 → Vec
+pub fn parse_genres(s: &str) -> Vec<String> {
+    s.split(',').map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect()
+}
+
+/// Vec → DB保存用文字列
+pub fn genres_to_string(genres: &[String]) -> String {
+    genres.join(",")
+}
+
+/// Vec → 表示用 "#EDM #House"
+pub fn genres_display(genres: &[String]) -> String {
+    genres.iter().map(|g| format!("#{}", g)).collect::<Vec<_>>().join(" ")
 }
 
 /// アーティストデータ

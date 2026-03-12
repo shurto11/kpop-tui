@@ -17,7 +17,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use db::Database;
 use models::Config;
-use tui::{app::App, input::{handle_key, process_bpm_result, process_scrape_result, tick_bpm_pending}, ui::draw};
+use tui::{app::App, input::{handle_key, process_bpm_result, process_scrape_result, tick_bpm_pending, quiz_auto_play}, ui::draw};
 
 fn main() -> Result<()> {
     // 設定ファイルのパス
@@ -203,7 +203,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         app.show_message("Cancelled");
                     }
                 } else {
+                    let prev_screen = app.screen.clone();
                     handle_key(app, key);
+                    // Quiz開始時のSpotify自動再生（QuizResultからの遷移は除外：既にpre-play済み）
+                    if matches!(app.screen, tui::Screen::Quiz)
+                        && !matches!(prev_screen, tui::Screen::Quiz | tui::Screen::QuizResult)
+                        && !app.quiz_questions.is_empty()
+                    {
+                        quiz_auto_play(app);
+                    }
                 }
             }
         }
@@ -214,9 +222,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
 /// データディレクトリを取得
 fn get_data_dir() -> PathBuf {
-    // ~/my-tui/kpop-tui/
+    // ~/ssd/my-tui/kpop-tui/
     dirs::home_dir()
-        .map(|h| h.join("my-tui").join("kpop-tui"))
+        .map(|h| h.join("ssd").join("my-tui").join("kpop-tui"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

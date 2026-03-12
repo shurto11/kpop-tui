@@ -38,6 +38,10 @@ pub enum Screen {
     ViewTrackData,
     ViewArtistData,
     ViewWriterData,
+    // Quiz
+    Quiz,
+    QuizResult,
+    QuizFinal,
 }
 
 /// メニュー項目
@@ -96,6 +100,7 @@ pub struct App {
     pub writer_total_count: i64,
     pub search_writer_data: Option<WriterData>,
     pub writer_ranks: Vec<(String, i64)>,
+    pub writer_data_names: std::collections::HashSet<String>,
 
     // View内検索
     pub search_query: String,
@@ -105,6 +110,9 @@ pub struct App {
     // 入力中のデータ
     pub current_artist: String,
     pub current_track: String,
+    // 編集時のSOTY/AOTY保持
+    pub edit_is_soty: bool,
+    pub edit_is_aoty: bool,
 
     // メッセージ
     pub message: Option<String>,
@@ -167,6 +175,14 @@ pub struct App {
     pub pending_delete_index: Option<usize>,
     // ViewLog: 削除Undo用スタック
     pub log_undo_stack: Vec<CreditData>,
+
+    // Quiz状態
+    pub quiz_questions: Vec<(String, String, String)>, // (artist, track, spotify_url)
+    pub quiz_current: usize,
+    pub quiz_score: usize,
+    pub quiz_last_correct: bool,
+    pub quiz_last_answer: String,
+    pub quiz_last_actual: String,
 }
 
 /// TrackDataフィルタ
@@ -250,6 +266,10 @@ impl App {
                 label: "View".to_string(),
                 screen: Screen::ViewMenu,
             },
+            MenuItem {
+                label: "Quiz".to_string(),
+                screen: Screen::Quiz,
+            },
         ];
 
         let mut app = Self {
@@ -286,11 +306,14 @@ impl App {
             writer_total_count: 0,
             search_writer_data: None,
             writer_ranks: Vec::new(),
+            writer_data_names: std::collections::HashSet::new(),
             search_query: String::new(),
             search_match_indices: Vec::new(),
             search_match_pos: 0,
             current_artist: String::new(),
             current_track: String::new(),
+            edit_is_soty: false,
+            edit_is_aoty: false,
             message: None,
             error: None,
             pending_g: false,
@@ -324,6 +347,12 @@ impl App {
             is_random_fallback: false,
             pending_delete_index: None,
             log_undo_stack: Vec::new(),
+            quiz_questions: Vec::new(),
+            quiz_current: 0,
+            quiz_score: 0,
+            quiz_last_correct: false,
+            quiz_last_answer: String::new(),
+            quiz_last_actual: String::new(),
         };
         app.load_screen_data();
         app
@@ -336,6 +365,12 @@ impl App {
             self.bpm_receiver = None;
             self.bpm_cache = None;
             self.bpm_cache_artist.clear();
+        }
+        // Quiz系以外に遷移する場合はQuiz状態クリア
+        if !matches!(screen, Screen::Quiz | Screen::QuizResult | Screen::QuizFinal) {
+            self.quiz_questions.clear();
+            self.quiz_current = 0;
+            self.quiz_score = 0;
         }
         self.screen_stack.push((self.screen.clone(), self.list_index, self.list_offset, self.menu_index));
         self.screen = screen;
@@ -350,6 +385,8 @@ impl App {
         self.form_index = 0;
         self.current_artist.clear();
         self.current_track.clear();
+        self.edit_is_soty = false;
+        self.edit_is_aoty = false;
         self.search_query.clear();
         self.search_match_indices.clear();
         self.suggestion_index = 0;
@@ -414,6 +451,10 @@ impl App {
                 MenuItem {
                     label: "View".to_string(),
                     screen: Screen::ViewMenu,
+                },
+                MenuItem {
+                    label: "Quiz".to_string(),
+                    screen: Screen::Quiz,
                 },
             ],
             Screen::InputMenu => vec![
@@ -618,9 +659,11 @@ impl App {
             }
             Screen::ViewLog => {
                 self.credits = self.db.get_songs_by_log().unwrap_or_default();
+                self.writer_data_names = self.db.get_writer_data_names().unwrap_or_default();
             }
             Screen::ViewCreditData => {
                 self.credits = self.db.get_songs_sorted().unwrap_or_default();
+                self.writer_data_names = self.db.get_writer_data_names().unwrap_or_default();
             }
             Screen::ViewTrackData => {
                 self.tracks = self.db.get_all_track_data().unwrap_or_default();
@@ -694,6 +737,7 @@ impl App {
                 if let Ok(artists) = self.db.get_all_artists() {
                     self.suggestions = artists;
                 }
+                self.suggestion_index = 0;
                 self.input_label = "Artist".to_string();
                 self.mode = Mode::Insert;
             }
@@ -707,11 +751,31 @@ impl App {
                 self.search_writer_data = self.db.get_writer(name).unwrap_or(None);
                 self.writer_ranks = self.db.get_writer_ranks(name).unwrap_or_default();
             }
+            Screen::Quiz => {
+                // 初回のみ問題をロード（QuizResult→Quiz遷移時はリロードしない）
+                if self.quiz_questions.is_empty() {
+                    self.quiz_questions = self.db.get_random_tracks_with_spotify(10).unwrap_or_default();
+                    self.quiz_current = 0;
+                    self.quiz_score = 0;
+                }
+                // SearchTrackと同じUI: Artist入力 → Track選択
+                if let Ok(artists) = self.db.get_all_artists() {
+                    self.suggestions = artists;
+                }
+                self.suggestion_index = 0;
+                self.input_label = "Artist".to_string();
+                self.mode = Mode::Insert;
+                // Spotify自動再生はinput::quiz_auto_playから行う（load_screen_data後に呼ぶ）
+            }
+            Screen::QuizResult | Screen::QuizFinal => {
+                // 結果表示画面: データロード不要
+            }
             Screen::SearchTrackResult { artist, track } => {
                 self.album_art_current = None;
                 self.search_results = self.db.search_song(artist, track).unwrap_or_default();
                 self.search_track_data = self.db.get_song_add(artist, track).unwrap_or(None);
                 self.search_artist_label = self.db.get_artist(artist).ok().flatten().and_then(|a| a.label);
+                self.writer_data_names = self.db.get_writer_data_names().unwrap_or_default();
 
                 // Around-The-Day Drops取得
                 if let Some(credit) = self.search_results.first() {
@@ -769,7 +833,6 @@ impl App {
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -784,6 +847,7 @@ impl App {
             Screen::SearchWriterResult { .. } | Screen::SearchTrackResult { .. } => {
                 self.search_results.len()
             }
+            Screen::Quiz => self.suggestions.len(),
             _ => self.menu_items.len(),
         }
     }
