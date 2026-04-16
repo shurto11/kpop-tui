@@ -905,9 +905,10 @@ fn compute_aka_pairs(db: &Database) -> Vec<(String, String, bool)> {
     pairs.sort();
     pairs.dedup();
 
-    // Aka状態を確認し、Akaペアを先頭にソート
+    // 非表示ペアを除外し、Aka状態を確認してAkaペアを先頭にソート
     let mut result: Vec<(String, String, bool)> = pairs
         .into_iter()
+        .filter(|(a, b)| !db.is_aka_dismissed(a, b))
         .map(|(a, b)| {
             let is_aka = db.is_aka_pair(&a, &b).unwrap_or(false);
             (a, b, is_aka)

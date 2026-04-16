@@ -185,6 +185,17 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             }
         }
 
+        // フィールドを全削除（Inputスクリーンのノーマルモード）
+        KeyCode::Char('d') if matches!(
+            app.screen,
+            Screen::InputCreditData | Screen::InputArtistData | Screen::InputWriterData | Screen::InputTrackData
+        ) => {
+            if let Some(field) = app.form_fields.get_mut(app.form_index) {
+                field.value.clear();
+                field.cursor = 0;
+            }
+        }
+
         // 半ページ上
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let half = app.visible_rows / 2;
@@ -269,12 +280,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             handle_space(app);
         }
 
-        // ViewLog: 削除 (y/nで確認)
+        // ViewLog: 削除 (y/nで確認) / WriterAka: 非表示
         KeyCode::Char('d') => {
             if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
                 let c = &app.credits[app.list_index];
                 app.show_message(&format!("Delete '{} - {}'? (y/n)", c.artist, c.track));
                 app.pending_delete_index = Some(app.list_index);
+            } else if matches!(app.screen, Screen::InputWriterAka) && !app.aka_pairs.is_empty() {
+                handle_writer_aka_dismiss(app);
             }
         }
 
@@ -1875,9 +1888,22 @@ fn handle_space(app: &mut App) {
 fn handle_open_url(_app: &mut App) {
 }
 
-/// コマンドファイルのパス
-const SPOTIFY_CMD_FILE: &str = "/tmp/kpop4-spotify-cmd";
-const SPOTIFY_STATUS_FILE: &str = "/tmp/kpop4-spotify-status";
+/// Spotify URLをURIに変換
+/// https://open.spotify.com/track/XXX?si=yyy → spotify:track:XXX
+/// spotify:track:XXX → spotify:track:XXX (そのまま)
+fn spotify_url_to_uri(url: &str) -> Option<String> {
+    if url.starts_with("spotify:") {
+        return Some(url.split('?').next()?.to_string());
+    }
+    let path = url.split('?').next()?.trim_end_matches('/');
+    let parts: Vec<&str> = path.split('/').collect();
+    let n = parts.len();
+    if n >= 2 && !parts[n - 1].is_empty() {
+        Some(format!("spotify:{}:{}", parts[n - 2], parts[n - 1]))
+    } else {
+        None
+    }
+}
 
 /// Spotify再生を開始
 fn handle_open_spotify(app: &mut App) {
@@ -1920,81 +1946,48 @@ fn handle_open_spotify(app: &mut App) {
     };
 
     // 同じURLで一時停止中なら再開
-    if url == app.spotify_url && !app.spotify_playing && spotify_process_alive() {
-        send_spotify_command("toggle");
+    if url == app.spotify_url && !app.spotify_playing {
+        let _ = std::process::Command::new("spotatui")
+            .args(["playback", "--toggle"])
+            .spawn();
         app.spotify_playing = true;
         app.show_message("Resumed");
         return;
     }
 
-    // URLが変わった or 新規 → プロセス再起動
-    stop_spotify(app);
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::remove_file(SPOTIFY_CMD_FILE);
-    let _ = std::fs::remove_file(SPOTIFY_STATUS_FILE);
-
-    match std::process::Command::new("xvfb-run")
-        .args(["--auto-servernum", "npx", "tsx", "spotify-play.ts", &url])
-        .current_dir(dirs::home_dir().unwrap_or_default().join("ssbrowse"))
-        .env("PULSE_SERVER", "/run/user/1000/pulse/native")
-        .env("XDG_RUNTIME_DIR", "/run/user/1000")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(_) => {
-            app.spotify_url = url.clone();
-
-            let (tx, rx) = std::sync::mpsc::channel();
-            app.spotify_receiver = Some(rx);
-
-            std::thread::spawn(move || {
-                // ステータスファイルをポーリング（100ms間隔、最大60秒）
-                for _ in 0..600 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if let Ok(status) = std::fs::read_to_string(SPOTIFY_STATUS_FILE) {
-                        let status = status.trim().to_string();
-                        if !status.is_empty() {
-                            let _ = std::fs::remove_file(SPOTIFY_STATUS_FILE);
-                            if status.starts_with("Playing") || status.starts_with("Already playing") {
-                                let _ = tx.send(Ok(status));
-                            } else {
-                                let _ = tx.send(Err(status));
-                            }
-                            return;
-                        }
-                    }
-                }
-                let _ = tx.send(Err("Spotify timeout".to_string()));
-            });
-        }
-        Err(e) => app.show_error(&format!("Failed to play: {}", e)),
-    }
+    start_spotify_play(app, &url);
 }
 
-/// Spotifyプロセスを終了（アプリ終了時用）
+/// Spotifyを一時停止（アプリ終了時用）
 fn stop_spotify(app: &mut App) {
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "spotify-play"])
-        .output();
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "chrome.*chrome-data[^-]"])
-        .output();
+    if app.spotify_playing {
+        let _ = std::process::Command::new("spotatui")
+            .args(["playback", "--toggle"])
+            .output();
+    }
     app.spotify_playing = false;
-}
-
-/// spotify-playプロセスが生きているか
-fn spotify_process_alive() -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-f", "spotify-play"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// Spotifyにコマンドを送信
 fn send_spotify_command(cmd: &str) {
-    let _ = std::fs::write(SPOTIFY_CMD_FILE, cmd);
+    match cmd {
+        "toggle" => {
+            let _ = std::process::Command::new("spotatui")
+                .args(["playback", "--toggle"])
+                .spawn();
+        }
+        "forward" => {
+            let _ = std::process::Command::new("spotatui")
+                .args(["playback", "--seek", "+10"])
+                .spawn();
+        }
+        "backward" => {
+            let _ = std::process::Command::new("spotatui")
+                .args(["playback", "--seek", "-10"])
+                .spawn();
+        }
+        _ => {}
+    }
 }
 
 /// 文字インデックスをバイトインデックスに変換
@@ -2175,6 +2168,26 @@ fn handle_writer_aka_toggle(app: &mut App) {
     }
 }
 
+/// WriterAka: ペアを非表示にする（dで呼ばれる）
+fn handle_writer_aka_dismiss(app: &mut App) {
+    if let Some((name_a, name_b, is_aka)) = app.aka_pairs.get(app.list_index).cloned() {
+        if is_aka {
+            app.show_message("Aka ON のペアは削除できません");
+            return;
+        }
+        match app.db.dismiss_aka_pair(&name_a, &name_b) {
+            Ok(()) => {
+                app.aka_pairs.remove(app.list_index);
+                if app.list_index >= app.aka_pairs.len() && app.list_index > 0 {
+                    app.list_index -= 1;
+                }
+                app.show_message(&format!("{} ↔ {} dismissed", name_a, name_b));
+            }
+            Err(e) => app.show_error(&format!("Failed: {}", e)),
+        }
+    }
+}
+
 /// Quiz: 回答チェック
 fn handle_quiz_answer(app: &mut App, answered_artist: &str, answered_track: &str) {
     if let Some((correct_artist, correct_track, _)) = app.quiz_questions.get(app.quiz_current).cloned() {
@@ -2303,49 +2316,38 @@ pub fn quiz_auto_play(app: &mut App) {
 
 /// Spotify再生を開始（共通処理）
 fn start_spotify_play(app: &mut App, url: &str) {
-    // stop & start
-    let _ = std::process::Command::new("pkill").args(["-f", "spotify-play"]).output();
-    let _ = std::process::Command::new("pkill").args(["-f", "chrome.*chrome-data[^-]"]).output();
-    app.spotify_playing = false;
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::remove_file(SPOTIFY_CMD_FILE);
-    let _ = std::fs::remove_file(SPOTIFY_STATUS_FILE);
+    let Some(uri) = spotify_url_to_uri(url) else {
+        return;
+    };
 
-    let url_owned = url.to_string();
-    match std::process::Command::new("xvfb-run")
-        .args(["--auto-servernum", "npx", "tsx", "spotify-play.ts", &url_owned])
-        .current_dir(dirs::home_dir().unwrap_or_default().join("ssbrowse"))
-        .env("PULSE_SERVER", "/run/user/1000/pulse/native")
-        .env("XDG_RUNTIME_DIR", "/run/user/1000")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(_) => {
-            app.spotify_url = url_owned.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            app.spotify_receiver = Some(rx);
-            std::thread::spawn(move || {
-                for _ in 0..600 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if let Ok(status) = std::fs::read_to_string(SPOTIFY_STATUS_FILE) {
-                        let status = status.trim().to_string();
-                        if !status.is_empty() {
-                            let _ = std::fs::remove_file(SPOTIFY_STATUS_FILE);
-                            if status.starts_with("Playing") || status.starts_with("Already playing") {
-                                let _ = tx.send(Ok(status));
-                            } else {
-                                let _ = tx.send(Err(status));
-                            }
-                            return;
-                        }
-                    }
-                }
-                let _ = tx.send(Err("Spotify timeout".to_string()));
-            });
+    app.spotify_playing = false;
+    app.spotify_url = url.to_string();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.spotify_receiver = Some(rx);
+
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("spotatui")
+            .args(["play", "--uri", &uri])
+            .output();
+        match result {
+            Ok(o) if o.status.success() => {
+                let _ = tx.send(Ok("Playing".to_string()));
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let msg = if err.is_empty() {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                } else {
+                    err
+                };
+                let _ = tx.send(Err(if msg.is_empty() { "Play failed".to_string() } else { msg }));
+            }
+            Err(e) => {
+                let _ = tx.send(Err(format!("spotatui not found: {}", e)));
+            }
         }
-        Err(_) => {}
-    }
+    });
 }
 
 /// スクレイピング結果を処理
@@ -2379,6 +2381,8 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
                 }
             }
 
+            let date_warn = if info.date.is_none() { " [WARNING: date not found]" } else { "" };
+
             // アーティストがDBにない場合、ArtistData画面に遷移
             if artist_not_found {
                 let artist_name = info.artist.clone();
@@ -2394,16 +2398,16 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
                 app.suggestions.clear();
                 // go_toがmessageをクリアするので、遷移後にメッセージをセット
                 app.show_message(&format!(
-                    "Added {} credits for '{}'. New artist '{}' - please register.",
-                    inserted, info.track, artist_name
+                    "Added {} credits for '{}'.{} New artist '{}' - please register.",
+                    inserted, info.track, date_warn, artist_name
                 ));
                 return;
             }
 
             if inserted > 0 {
                 app.show_message(&format!(
-                    "Added {} credits for '{}'",
-                    inserted, info.track
+                    "Added {} credits for '{}'{}",
+                    inserted, info.track, date_warn
                 ));
             } else {
                 app.show_message("No new credits found");

@@ -81,6 +81,14 @@ impl Database {
                 UNIQUE(primary_name, alias_name)
             );
 
+            -- Akaペア非表示リスト
+            CREATE TABLE IF NOT EXISTS aka_dismissed (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name_a TEXT NOT NULL,
+                name_b TEXT NOT NULL,
+                UNIQUE(name_a, name_b)
+            );
+
             -- インデックス
             CREATE INDEX IF NOT EXISTS idx_song_artist ON credit_data(artist);
             CREATE INDEX IF NOT EXISTS idx_song_track ON credit_data(track);
@@ -1371,6 +1379,34 @@ impl Database {
             self.add_writer_aka(name_a, name_b)?;
             Ok(true)
         }
+    }
+
+    /// Akaペアを非表示にする
+    pub fn dismiss_aka_pair(&self, name_a: &str, name_b: &str) -> Result<()> {
+        let (a, b) = if name_a < name_b { (name_a, name_b) } else { (name_b, name_a) };
+        self.conn.execute(
+            "INSERT OR IGNORE INTO aka_dismissed (name_a, name_b) VALUES (?1, ?2)",
+            params![a, b],
+        )?;
+        Ok(())
+    }
+
+    /// Akaペアが非表示かチェック
+    pub fn is_aka_dismissed(&self, name_a: &str, name_b: &str) -> bool {
+        let (a, b) = if name_a < name_b { (name_a, name_b) } else { (name_b, name_a) };
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM aka_dismissed WHERE name_a = ?1 AND name_b = ?2",
+                params![a, b],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
+    /// 非表示リストをすべてクリア
+    pub fn clear_aka_dismissed(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM aka_dismissed", [])?;
+        Ok(())
     }
 
     /// 全テーブルをCSVにエクスポート

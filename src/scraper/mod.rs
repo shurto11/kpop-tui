@@ -91,21 +91,35 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
         .map(|el| el.text().collect::<String>().trim().to_string())
         .unwrap_or_default();
 
-    // リリース日
-    let date_selector = Selector::parse(&format!(
-        "span.LabelWithIcon__Label-sc-a1922d73-1.{}",
-        config.genius.date_key
-    ))
-    .map_err(|e| anyhow::anyhow!("Invalid date selector: {:?}", e))?;
+    // リリース日（設定キーで試み、失敗したら全spanからdateパターンを検索）
+    let date = {
+        let configured = if !config.genius.date_key.is_empty() {
+            // クラス名にdate_keyが含まれるspanを検索
+            let span_sel = Selector::parse("span").ok();
+            span_sel.and_then(|sel| {
+                document.select(&sel).find_map(|el| {
+                    let has_key = el.value().classes().any(|c| c == config.genius.date_key);
+                    if has_key {
+                        let raw = el.text().collect::<String>().trim().to_string();
+                        parse_date(&raw)
+                    } else {
+                        None
+                    }
+                })
+            })
+        } else {
+            None
+        };
 
-    let date = document
-        .select(&date_selector)
-        .next()
-        .map(|el| {
-            let raw_date = el.text().collect::<String>().trim().to_string();
-            parse_date(&raw_date)
+        // フォールバック: 全spanから日付パターンで検索
+        configured.or_else(|| {
+            let span_sel = Selector::parse("span").ok()?;
+            document.select(&span_sel).find_map(|el| {
+                let text = el.text().collect::<String>().trim().to_string();
+                parse_date(&text)
+            })
         })
-        .flatten();
+    };
 
     // アルバム名
     let album_selector = Selector::parse("a[href=\"#primary-album\"].StyledLink-sc-15c685a-0")

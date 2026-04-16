@@ -222,9 +222,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
 /// データディレクトリを取得
 fn get_data_dir() -> PathBuf {
-    // ~/ssd/my-tui/kpop-tui/
+    // ~/ssd/tui/kpop-tui/
     dirs::home_dir()
-        .map(|h| h.join("ssd").join("my-tui").join("kpop-tui"))
+        .map(|h| h.join("ssd").join("tui").join("kpop-tui"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

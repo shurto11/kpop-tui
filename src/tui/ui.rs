@@ -879,7 +879,7 @@ fn draw_writer_aka(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Writer Aka ({}) [Space: toggle]", app.aka_pairs.len())),
+            .title(format!("Writer Aka ({}) [Space: toggle, d: dismiss]", app.aka_pairs.len())),
     );
 
     frame.render_widget(list, area);
