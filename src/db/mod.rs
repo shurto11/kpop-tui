@@ -236,12 +236,61 @@ impl Database {
         let re = regex::Regex::new(
             r"\s*[\(\[（【][^\)\]）】]*[\u{AC00}-\u{D7A3}][^\)\]）】]*[\)\]）】]"
         ).unwrap();
-        let result = re.replace_all(name, "");
+        let name = Self::strip_feat_and_stray_parens_inline(name);
+        let result = re.replace_all(&name, "");
         let result: String = result
             .chars()
             .filter(|c| !('\u{AC00}'..='\u{D7A3}').contains(c))
             .collect();
         result.trim().to_string()
+    }
+
+    /// ゼロ幅文字、"(Ft. ...)" グループ（入れ子の括弧を含む）、対応する開き括弧のない ")" を除去
+    /// 例: "MASHIRO (Ft. BOBBY (바비))" → "MASHIRO", "MASHIRO)" → "MASHIRO"
+    fn strip_feat_and_stray_parens_inline(name: &str) -> String {
+        // ゼロ幅文字（"\u{200B}pH-1" など）は見た目が同じで別名扱いになるため除去
+        let chars: Vec<char> = name
+            .chars()
+            .filter(|c| !matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}'))
+            .collect();
+        let mut out = String::new();
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '(' {
+                let rest: String = chars[i + 1..].iter().collect::<String>().to_lowercase();
+                if rest.starts_with("ft.") || rest.starts_with("feat.") {
+                    // 対応する ")" まで読み飛ばす
+                    let mut d = 0usize;
+                    while i < chars.len() {
+                        match chars[i] {
+                            '(' => d += 1,
+                            ')' => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                depth += 1;
+            } else if c == ')' {
+                if depth == 0 {
+                    i += 1;
+                    continue;
+                }
+                depth -= 1;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out.trim().to_string()
     }
 
     /// 既存データのアーティスト名を一括正規化（起動時マイグレーション）
