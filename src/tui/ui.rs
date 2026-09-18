@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use chrono::{Datelike, Local, NaiveDate};
-use crate::tui::app::{App, Mode, Screen};
+use crate::tui::app::{App, AutoAddPhase, AutoAddRow, AutoAddStatus, Mode, Screen};
 
 /// AOTY/SOTY用の金色
 const GOLD: Color = Color::Rgb(255, 215, 0);
@@ -129,6 +129,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let title = match &app.screen {
         Screen::MainMenu => "kpop-tui",
         Screen::InputMenu => "Input",
+        Screen::InputAutoAdd => "Input > AutoAdd",
         Screen::InputCreditData => "Input > CreditData",
         Screen::InputTrackData => "Input > TrackData",
         Screen::InputArtistData => "Input > ArtistData",
@@ -216,6 +217,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Screen::InputWriterAka => {
             draw_writer_aka(frame, app, area);
+        }
+        Screen::InputAutoAdd => {
+            draw_auto_add(frame, app, area);
         }
         Screen::InputTrackData => {
             // フォーム表示中はフォーム描画、それ以外はSuggestions選択
@@ -329,6 +333,17 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 Screen::InputWriterAka => {
                     "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q: Quit"
+                }
+                Screen::InputAutoAdd => {
+                    if app.auto_add_editing.is_some() {
+                        "Enter: Save  Tab: Next Field  Esc: Cancel  ←→: Cursor  BS: Delete"
+                    } else {
+                        match app.auto_add_phase {
+                            AutoAddPhase::Fetching => "Esc: Cancel",
+                            AutoAddPhase::Checking => "Esc: Cancel scan",
+                            _ => "j/k: Move  e: Edit  d: Delete  r: Recheck  o: Open  Enter: Add All  h/Esc: Back",
+                        }
+                    }
                 }
                 Screen::ViewLog => {
                     if app.editing_log_album {
@@ -887,6 +902,155 @@ fn draw_writer_aka(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     frame.render_widget(list, area);
+}
+
+/// AutoAdd: Spotifyお気に入りからの追加候補一覧
+fn draw_auto_add(frame: &mut Frame, app: &App, area: Rect) {
+    let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spin = spinner[app.tick % spinner.len()];
+
+    if app.auto_add_rows.is_empty() {
+        let (text, color) = match app.auto_add_phase {
+            AutoAddPhase::Fetching => (
+                format!("{} Fetching liked songs from Spotify...", spin),
+                Color::Yellow,
+            ),
+            // design.md: 追加する曲がないことは英語で伝える
+            AutoAddPhase::Empty => ("No songs to add".to_string(), Color::DarkGray),
+            _ => ("No songs to add".to_string(), Color::DarkGray),
+        };
+        let empty = Paragraph::new(text)
+            .style(Style::default().fg(color))
+            .block(Block::default().borders(Borders::ALL).title("AutoAdd"));
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let end = (app.list_offset + app.visible_rows).min(app.auto_add_rows.len());
+    let visible = &app.auto_add_rows[app.list_offset..end];
+
+    let items: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let actual_index = app.list_offset + i;
+            let is_cursor = actual_index == app.list_index;
+            let prefix = if is_cursor { "> " } else { "  " };
+
+            let (mark, mark_color) = match row.status {
+                AutoAddStatus::Pending => ("[ ]".to_string(), Color::DarkGray),
+                AutoAddStatus::Checking => (format!("[{}]", spin), Color::Yellow),
+                AutoAddStatus::Ok => ("[✓]".to_string(), Color::Green),
+                AutoAddStatus::NotFound => ("[✗]".to_string(), Color::Red),
+                AutoAddStatus::NetError => ("[!]".to_string(), Color::Yellow),
+                AutoAddStatus::Duplicate => ("[dup]".to_string(), Color::DarkGray),
+                AutoAddStatus::NoArtist => ("[✗]".to_string(), Color::Red),
+            };
+
+            let editing_track = is_cursor && app.auto_add_editing == Some(0);
+            let editing_artist = is_cursor && app.auto_add_editing == Some(1);
+
+            let mut spans = vec![
+                Span::raw(prefix),
+                Span::styled(
+                    mark,
+                    Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ];
+
+            if editing_track {
+                spans.push(Span::styled(
+                    format!(">{}", app.edit_buffer),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw(truncate_str(&row.track, 34)));
+            }
+
+            spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
+
+            if editing_artist {
+                spans.push(Span::styled(
+                    format!(">{}", app.edit_buffer),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw(truncate_str(&row.artist, 24)));
+            }
+
+            // 追加日は YYYY-MM-DD だけ見せる
+            let date = row.added_at.split('T').next().unwrap_or("").to_string();
+            if !date.is_empty() {
+                spans.push(Span::styled(
+                    format!("  ({})", date),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // ✗ だった値は ✓ になった後も残す（何をどう直したか追えるように）
+            if let Some(reason) = failed_note(row) {
+                spans.push(Span::styled(
+                    format!("   ✗ was: {}", reason),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ));
+            }
+
+            if row.status == AutoAddStatus::NoArtist {
+                spans.push(Span::styled(
+                    "  artist not registered",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+
+            ListItem::new(Line::from(spans)).style(row_style(app, actual_index))
+        })
+        .collect();
+
+    let ok = app
+        .auto_add_rows
+        .iter()
+        .filter(|r| r.status == AutoAddStatus::Ok)
+        .count();
+    let title = match app.auto_add_phase {
+        AutoAddPhase::Checking => format!(
+            "AutoAdd ({}) {} checking {}/{}",
+            app.auto_add_rows.len(),
+            spin,
+            app.auto_add_done,
+            app.auto_add_total
+        ),
+        _ => format!(
+            "AutoAdd ({}) [{} ready] [e: edit, d: delete, r: recheck, Enter: add all]",
+            app.auto_add_rows.len(),
+            ok
+        ),
+    };
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
+}
+
+/// ✗ だったときの値を1行で表す。編集で直した場合も自動で直った場合も残す。
+/// 曲名・アーティスト名が変わっていない（＝URLの作り方だけが外れていた）場合は、
+/// 外れたURLのスラッグを見せる
+fn failed_note(row: &AutoAddRow) -> Option<String> {
+    let track_changed = row.failed_track.as_ref().is_some_and(|t| *t != row.track);
+    let artist_changed = row.failed_artist.as_ref().is_some_and(|a| *a != row.artist);
+
+    match (track_changed, artist_changed) {
+        (true, true) => Some(format!(
+            "{} — {}",
+            row.failed_track.as_ref().unwrap(),
+            row.failed_artist.as_ref().unwrap()
+        )),
+        (true, false) => row.failed_track.clone(),
+        (false, true) => row.failed_artist.clone(),
+        // 名前は同じでURLだけ外れていた場合
+        (false, false) => row.failed_url.as_ref().map(|u| {
+            u.rsplit('/').next().unwrap_or(u.as_str()).to_string()
+        }),
+    }
 }
 
 /// TrackDataフォーム表示

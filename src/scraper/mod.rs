@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -44,12 +47,16 @@ fn clean_text(text: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
-/// Geniusから曲情報をスクレイピング
-pub fn scrape_genius(url: &str, config: &Config) -> Result<ScrapedSongInfo> {
-    let client = reqwest::blocking::Client::builder()
+/// Genius用のHTTPクライアント。タイムアウトなしだとハングした1本がワーカーを永久に止める
+fn genius_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-        .build()?;
+        .timeout(Duration::from_secs(10))
+        .build()?)
+}
 
+/// 1ページ取得する。ステータスコードとボディを返す。
+fn genius_get(client: &reqwest::blocking::Client, url: &str) -> Result<(reqwest::StatusCode, String)> {
     let response = client
         .get(url)
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -57,8 +64,228 @@ pub fn scrape_genius(url: &str, config: &Config) -> Result<ScrapedSongInfo> {
         .send()
         .context("Failed to fetch page")?;
 
+    let status = response.status();
     let html = response.text().context("Failed to read response")?;
+    Ok((status, html))
+}
+
+/// Geniusから曲情報をスクレイピング
+pub fn scrape_genius(url: &str, config: &Config) -> Result<ScrapedSongInfo> {
+    let client = genius_client()?;
+    let (status, html) = genius_get(&client, url)?;
+
+    // 存在しない曲でもGeniusは404と一緒に長いHTMLを返す。
+    // ステータスを見ないと、404ページのタイトルから偽のartist/trackを拾ってしまう。
+    if status == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Page not found (404): {}", url);
+    }
+    if !status.is_success() {
+        anyhow::bail!("HTTP {} from Genius", status);
+    }
+
     parse_genius_html(&html, config)
+}
+
+/// Geniusページ存在確認の結果
+#[derive(Debug)]
+pub enum GeniusCheck {
+    /// 2xxかつパース成功。
+    /// failed_url は、第1候補が404で第2候補以降が当たった場合の「外れたURL」
+    Found {
+        url: String,
+        info: Box<ScrapedSongInfo>,
+        failed_url: Option<String>,
+    },
+    /// 全候補が404
+    NotFound { tried: Vec<String> },
+    /// 通信失敗・タイムアウト・その他ステータス。ページ不存在とは区別する
+    NetworkError(String),
+}
+
+/// 曲名から `(feat. ...)` / `(with ...)` を除去
+fn strip_feat(track: &str) -> String {
+    let re = Regex::new(r"(?i)\s*[\(\[]\s*(feat\.?|ft\.?|with)\s[^\)\]]*[\)\]]").unwrap();
+    re.replace_all(track, "").trim().to_string()
+}
+
+/// 曲名の ` - ...` 以降を除去（"SIGN - Japanese Ver." → "SIGN"）
+fn strip_dash_suffix(track: &str) -> String {
+    match track.find(" - ") {
+        Some(pos) => track[..pos].trim().to_string(),
+        None => track.trim().to_string(),
+    }
+}
+
+/// アーティスト名から2人目以降を落とす（"A & B" / "A, B" → "A"）
+fn primary_artist(artist: &str) -> String {
+    let re = Regex::new(r"\s*(,|&|feat\.?|ft\.?|with)\s+").unwrap();
+    match re.find(artist) {
+        Some(m) => artist[..m.start()].trim().to_string(),
+        None => artist.trim().to_string(),
+    }
+}
+
+/// 括弧を「空白に変換」ではなく「そのまま削除」する。
+/// clean_text は `(` を空白にするので "ALL(H)OURS" → "all-h-ours" になるが、
+/// Geniusの実際のスラッグは "allhours"。両方試す必要がある
+fn strip_parens(s: &str) -> String {
+    s.replace(['(', ')', '[', ']', '（', '）'], "")
+}
+
+/// 末尾の括弧グループを丸ごと落とす（"Touch (Y2K Unit)" → "Touch"）。
+/// Geniusはバージョン表記を入れないことが多い
+fn strip_trailing_parens(s: &str) -> String {
+    let re = Regex::new(r"\s*[\(\[（][^\)\]）]*[\)\]）]\s*$").unwrap();
+    re.replace(s, "").trim().to_string()
+}
+
+/// アクセント付きラテン文字をASCIIに落とす（"México" → "Mexico"）。
+/// clean_textはASCII以外を素通しするので、そのままではスラッグが合わない
+fn fold_accents(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+            'Á' | 'À' | 'Â' | 'Ä' | 'Ã' | 'Å' => 'A',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'É' | 'È' | 'Ê' | 'Ë' => 'E',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+            'Ó' | 'Ò' | 'Ô' | 'Ö' | 'Õ' => 'O',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'Ú' | 'Ù' | 'Û' | 'Ü' => 'U',
+            'ñ' => 'n',
+            'Ñ' => 'N',
+            'ç' => 'c',
+            'Ç' => 'C',
+            other => other,
+        })
+        .collect()
+}
+
+/// 試すGenius URLの候補を順に組み立てる。
+/// Spotifyの曲名には `(feat. X)` や `- Japanese Ver.` が付いていてそのままでは404になり、
+/// 括弧入りのアーティスト名もスラッグの作り方が2通りあるため、段階的に削って数本試す。
+/// 重複は除き、最大4本まで。
+pub fn genius_url_candidates(artist: &str, track: &str) -> Vec<String> {
+    let no_feat = strip_feat(track);
+    let no_dash = strip_dash_suffix(&no_feat);
+    let main_artist = primary_artist(artist);
+
+    // 末尾の括弧を落とした形（"Touch (Y2K Unit)" → "Touch"）
+    let no_paren_suffix = strip_trailing_parens(&no_dash);
+
+    let variants: Vec<(String, String)> = vec![
+        // (1) そのまま
+        (artist.to_string(), track.to_string()),
+        // (2) 括弧を削除したアーティスト名（"ALL(H)OURS" → "allhours"）
+        (strip_parens(artist), track.to_string()),
+        // (3) feat. 除去
+        (artist.to_string(), no_feat.clone()),
+        // (4) " - ..." 以降を除去（"SIGN - Japanese Ver." → "SIGN"）
+        (artist.to_string(), no_dash.clone()),
+        // (5) 末尾の括弧グループを除去（"Touch (Y2K Unit)" → "Touch"）
+        (artist.to_string(), no_paren_suffix.clone()),
+        // (6) 括弧削除 ＋ 曲名も整理
+        (strip_parens(artist), no_paren_suffix.clone()),
+        // (7) 主アーティストのみ
+        (main_artist, no_paren_suffix),
+    ];
+
+    let mut urls = Vec::new();
+    for (a, t) in variants {
+        if a.trim().is_empty() || t.trim().is_empty() {
+            continue;
+        }
+        // アクセントを残した形と落とした形の両方を試す（"México" → "mexico"）
+        for (a, t) in [
+            (a.clone(), t.clone()),
+            (fold_accents(&a), fold_accents(&t)),
+        ] {
+            let url = make_url(&a, &t);
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        if urls.len() >= 5 {
+            break;
+        }
+    }
+    urls.truncate(5);
+    urls
+}
+
+/// 候補URLを順に試して、最初に見つかったページの情報を返す
+pub fn check_genius_candidates(
+    artist: &str,
+    track: &str,
+    config: &Config,
+    cancel: &AtomicBool,
+) -> GeniusCheck {
+    let client = match genius_client() {
+        Ok(c) => c,
+        Err(e) => return GeniusCheck::NetworkError(e.to_string()),
+    };
+
+    let candidates = genius_url_candidates(artist, track);
+    let mut tried: Vec<String> = Vec::new();
+
+    for url in &candidates {
+        if cancel.load(Ordering::Relaxed) {
+            return GeniusCheck::NetworkError("Cancelled".to_string());
+        }
+
+        let (status, html) = match genius_get(&client, url) {
+            Ok(v) => v,
+            Err(e) => return GeniusCheck::NetworkError(format!("{}", e)),
+        };
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tried.push(url.clone());
+            continue;
+        }
+
+        // 429はレート制限。Retry-Afterを待って1回だけやり直す
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            std::thread::sleep(Duration::from_secs(5));
+            match genius_get(&client, url) {
+                Ok((s2, h2)) if s2.is_success() => {
+                    return finish_found(url, &h2, config, &tried);
+                }
+                Ok((s2, _)) => {
+                    return GeniusCheck::NetworkError(format!("HTTP {} from Genius", s2));
+                }
+                Err(e) => return GeniusCheck::NetworkError(format!("{}", e)),
+            }
+        }
+
+        // 403などCloudflare由来のものは「存在しない」ではなくネットワーク側の問題として扱う
+        if !status.is_success() {
+            return GeniusCheck::NetworkError(format!("HTTP {} from Genius", status));
+        }
+
+        return finish_found(url, &html, config, &tried);
+    }
+
+    GeniusCheck::NotFound { tried }
+}
+
+/// 2xxが返ったページをパースして GeniusCheck に詰める
+fn finish_found(url: &str, html: &str, config: &Config, tried: &[String]) -> GeniusCheck {
+    match parse_genius_html(html, config) {
+        Ok(info) => GeniusCheck::Found {
+            url: url.to_string(),
+            info: Box::new(info),
+            // 第1候補が外れていたら、その外れたURLを残す
+            failed_url: tried.first().cloned(),
+        },
+        Err(_) => {
+            // 2xxだがパースできない＝実質見つからなかった扱い
+            let mut all = tried.to_vec();
+            all.push(url.to_string());
+            GeniusCheck::NotFound { tried: all }
+        }
+    }
 }
 
 /// HTMLをパースして曲情報を抽出
@@ -657,5 +884,48 @@ mod tests {
     fn test_parse_date() {
         assert_eq!(parse_date("Jan 1, 2024"), Some("2024-01-01".to_string()));
         assert_eq!(parse_date("Dec. 25, 2023"), Some("2023-12-25".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod autoadd_tests {
+    use super::*;
+
+    #[test]
+    fn candidates_strip_suffixes() {
+        let c = genius_url_candidates("izna", "SIGN - Japanese Ver.");
+        println!("izna/SIGN: {:?}", c);
+        assert!(c.iter().any(|u| u.ends_with("izna-sign-lyrics")));
+
+        let c = genius_url_candidates("LISA", "Rockstar (feat. Foo)");
+        println!("LISA: {:?}", c);
+        assert!(c.iter().any(|u| u.ends_with("lisa-rockstar-lyrics")));
+
+        let c = genius_url_candidates("A & B", "Song");
+        println!("A&B: {:?}", c);
+        assert!(c.len() <= 3);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_check() {
+        let cfg = Config::default();
+        let cancel = AtomicBool::new(false);
+        for (a, t) in [
+            ("Hearts2Hearts", "Moonride"),
+            ("ALL(H)OURS", "DANG DANG"),
+            ("izna", "SIGN - Japanese Ver."),
+            ("VERIVERY", "Touch (Y2K Unit)"),
+            ("CHUNG HA", "México"),
+        ] {
+            let r = check_genius_candidates(a, t, &cfg, &cancel);
+            match &r {
+                GeniusCheck::Found { url, info, failed_url } => {
+                    println!("OK   {} / {} -> {} (was: {:?}) date={:?}", a, t, url, failed_url, info.date);
+                }
+                GeniusCheck::NotFound { tried } => println!("MISS {} / {} tried={:?}", a, t, tried),
+                GeniusCheck::NetworkError(e) => println!("NET  {} / {} {}", a, t, e),
+            }
+        }
     }
 }

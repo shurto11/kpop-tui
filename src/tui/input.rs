@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::models::{ArtistData, BpmArtistInfo, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
 use crate::scraper::{find_all_tracks_in_bpm_data, make_songbpm_url, make_url, scrape_genius, scrape_songbpm};
-use crate::tui::app::{App, FormField, Mode, Screen, TrackFilter};
+use crate::tui::app::{App, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter};
 
 /// キー入力を処理
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -41,6 +41,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
     // ViewLog: アルバム名インライン編集
     if app.editing_log_album {
         handle_log_album_edit(app, key);
+        return;
+    }
+
+    // AutoAdd: Track/Artistのインライン編集
+    if app.auto_add_editing.is_some() {
+        handle_auto_add_edit(app, key);
         return;
     }
 
@@ -92,6 +98,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             if app.screen == Screen::MainMenu {
                 // MainMenuではEscで何もしない
+            } else if matches!(app.screen, Screen::InputAutoAdd) && auto_add_running(app) {
+                // app.loadingを使っていないのでmain.rs側のEscキャンセルは効かない。ここで止める
+                cancel_auto_add(app);
             } else if matches!(app.screen, Screen::QuizResult) {
                 handle_quiz_next(app);
             } else if matches!(app.screen, Screen::QuizFinal) {
@@ -291,7 +300,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // ViewLog: 削除 (y/nで確認) / WriterAka: 非表示
         KeyCode::Char('d') => {
-            if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
+            if matches!(app.screen, Screen::InputAutoAdd) {
+                handle_auto_add_delete(app);
+            } else if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
                 let c = &app.credits[app.list_index];
                 app.show_message(&format!("Delete ALL records for '{} - {}'? (y/n)", c.artist, c.track));
                 app.pending_delete_index = Some(app.list_index);
@@ -307,9 +318,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             }
         }
 
-        // ViewLog: リワインド（削除を元に戻す）
+        // ViewLog: リワインド（削除を元に戻す）/ AutoAdd: 再チェック
         KeyCode::Char('r') => {
-            if matches!(app.screen, Screen::ViewLog) {
+            if matches!(app.screen, Screen::InputAutoAdd) {
+                handle_auto_add_recheck(app);
+            } else if matches!(app.screen, Screen::ViewLog) {
                 if let Some(credit) = app.log_undo_stack.pop() {
                     match app.db.insert_song(&credit) {
                         Ok(_) => {
@@ -329,7 +342,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // URLを開く
         KeyCode::Char('o') => {
-            handle_open_url(app);
+            if matches!(app.screen, Screen::InputAutoAdd) {
+                handle_auto_add_open(app);
+            } else {
+                handle_open_url(app);
+            }
         }
 
         // Spotify再生
@@ -385,7 +402,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // View → Input に遷移（編集）
         KeyCode::Char('e') => {
-            if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
+            if matches!(app.screen, Screen::InputAutoAdd) && !app.auto_add_rows.is_empty() {
+                start_auto_add_edit(app, 0);
+            } else if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
                 let c = &app.credits[app.list_index];
                 app.edit_buffer = c.album.clone().unwrap_or_default();
                 app.edit_cursor = app.edit_buffer.chars().count();
@@ -1353,6 +1372,10 @@ fn is_suggestion_screen(screen: &Screen) -> bool {
 
 /// l/→ でインサートモードに入る、またはメニュー選択
 fn handle_enter_insert_or_select(app: &mut App) {
+    if matches!(app.screen, Screen::InputAutoAdd) {
+        // l/→ では追加しない（Enterのみ）。誤爆を防ぐ
+        return;
+    }
     if matches!(app.screen, Screen::QuizResult) {
         // QuizResult: 次の問題へ（最終問ならQuizFinalへ）
         handle_quiz_next(app);
@@ -1409,6 +1432,10 @@ fn handle_enter_insert_or_select(app: &mut App) {
 
 /// 選択を実行（Enter）
 fn handle_select(app: &mut App) {
+    if matches!(app.screen, Screen::InputAutoAdd) {
+        handle_auto_add_commit(app);
+        return;
+    }
     if matches!(app.screen, Screen::QuizResult) {
         handle_quiz_next(app);
         return;
@@ -2539,4 +2566,505 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
             app.show_error(&format!("Scraping failed: {}", e));
         }
     }
+}
+
+// ==================== AutoAdd ====================
+
+/// 曲名をマッチング用に正規化して比較する
+fn track_matches(a: &str, b: &str) -> bool {
+    let na = crate::scraper::normalize_track_name(a);
+    let nb = crate::scraper::normalize_track_name(b);
+    !na.is_empty() && na == nb
+}
+
+/// アーティスト名をマッチング用に正規化して比較する
+fn artist_matches(a: &str, b: &str) -> bool {
+    let na = crate::scraper::normalize_artist_name(a).to_lowercase();
+    let nb = crate::scraper::normalize_artist_name(b).to_lowercase();
+    !na.is_empty() && na == nb
+}
+
+/// ワーカーからのメッセージを処理する。DB操作はすべてここ（メインスレッド）で行う
+pub fn process_auto_add_msg(app: &mut App, msg: AutoAddMsg) {
+    match msg {
+        AutoAddMsg::Liked(Ok(liked)) => build_auto_add_rows(app, liked),
+        AutoAddMsg::Liked(Err(e)) => {
+            app.auto_add_phase = AutoAddPhase::Empty;
+            app.show_error(&e);
+        }
+        AutoAddMsg::Checked { id, seq, result } => apply_check_result(app, id, seq, result),
+        AutoAddMsg::Aborted(e) => {
+            app.auto_add_phase = AutoAddPhase::Ready;
+            app.show_error(&e);
+        }
+    }
+}
+
+/// お気に入り一覧から追加候補を切り出す。
+/// design.md通り「credit_dataのlog最新1曲をお気に入りの中で探し、それより新しいものだけ」を候補にする。
+fn build_auto_add_rows(app: &mut App, liked: Vec<crate::spotify::LikedTrack>) {
+    if liked.is_empty() {
+        app.auto_add_phase = AutoAddPhase::Empty;
+        app.show_message("No liked songs found on Spotify");
+        return;
+    }
+
+    // credit_dataに入っているのはGenius名、お気に入りはSpotify名なので素の一致では通らない。
+    // 曲名一致を主、アーティスト一致を補助にする。
+    let newest = app.db.get_newest_credit().unwrap_or(None);
+    let cut = newest.as_ref().and_then(|(artist, track)| {
+        liked.iter().position(|l| {
+            track_matches(&l.name, track) && l.artists.iter().any(|a| artist_matches(a, artist))
+        })
+        .or_else(|| liked.iter().position(|l| track_matches(&l.name, track)))
+    });
+
+    // 最新曲が見つかればそれより新しいものだけ、見つからなければ全件
+    let candidates: Vec<_> = match cut {
+        Some(idx) => liked[..idx].to_vec(),
+        None => liked.clone(),
+    };
+
+    if candidates.is_empty() {
+        app.auto_add_phase = AutoAddPhase::Empty;
+        app.show_message("No songs to add");
+        return;
+    }
+
+    app.auto_add_rows.clear();
+    for l in candidates {
+        let artist = l.artists.first().cloned().unwrap_or_default();
+        let id = app.auto_add_next_id;
+        app.auto_add_next_id += 1;
+
+        // 「最新1曲で切る」判定は、後から古い曲を手動で足すと最新曲がその古い曲になり
+        // 追加済みの曲が候補に戻る弱点を持つ。ここで重複を印して安全弁にする。
+        let dup = app.db.credit_exists(&artist, &l.name).unwrap_or(false);
+
+        app.auto_add_rows.push(AutoAddRow {
+            id,
+            seq: 0,
+            track: l.name.clone(),
+            artist,
+            artists_all: l.artists.clone(),
+            added_at: l.added_at.clone(),
+            status: if dup {
+                AutoAddStatus::Duplicate
+            } else {
+                AutoAddStatus::Pending
+            },
+            resolved_artist: None,
+            info: None,
+            genius_url: None,
+            spotify_album: l.album.clone(),
+            spotify_date: l.release_date.clone(),
+            failed_track: None,
+            failed_artist: None,
+            failed_url: None,
+        });
+    }
+
+    app.list_index = 0;
+    app.list_offset = 0;
+    start_pending_checks(app);
+}
+
+/// Pending状態の行をまとめてチェックにかける
+fn start_pending_checks(app: &mut App) {
+    let targets: Vec<(u64, u32, String, String)> = app
+        .auto_add_rows
+        .iter()
+        .filter(|r| r.status == AutoAddStatus::Pending)
+        .map(|r| (r.id, r.seq, r.artist.clone(), r.track.clone()))
+        .collect();
+
+    if targets.is_empty() {
+        app.auto_add_phase = AutoAddPhase::Ready;
+        return;
+    }
+
+    for row in app.auto_add_rows.iter_mut() {
+        if row.status == AutoAddStatus::Pending {
+            row.status = AutoAddStatus::Checking;
+        }
+    }
+    app.start_auto_add_check(targets);
+}
+
+/// チェック結果を行に反映する
+fn apply_check_result(app: &mut App, id: u64, seq: u32, result: crate::scraper::GeniusCheck) {
+    use crate::scraper::GeniusCheck;
+
+    // 行が消えている／編集で seq が進んでいる結果は捨てる。
+    // これがないと、スキャン中の削除・編集で別の行に○×が付く。
+    let Some(idx) = app.auto_add_rows.iter().position(|r| r.id == id) else {
+        app.auto_add_done += 1;
+        return;
+    };
+    if app.auto_add_rows[idx].seq != seq {
+        app.auto_add_done += 1;
+        return;
+    }
+
+    app.auto_add_done += 1;
+
+    match result {
+        GeniusCheck::Found {
+            url,
+            info,
+            failed_url,
+        } => {
+            // 実際にDBへ入るのはGenius名なので、未登録判定も必ずGenius名で行う。
+            // Spotify名で判定すると「判定は通ったのに未登録の名前で行が入る」ことが起きる。
+            let genius_artist = crate::scraper::normalize_artist_name(&info.artist);
+            let row_artist = app.auto_add_rows[idx].artist.clone();
+
+            let resolved = if app.db.get_artist(&genius_artist).ok().flatten().is_some() {
+                Some(genius_artist)
+            } else if app.db.get_artist(&row_artist).ok().flatten().is_some() {
+                Some(row_artist)
+            } else {
+                None
+            };
+
+            let row = &mut app.auto_add_rows[idx];
+
+            // 第1候補が404で第2候補以降が当たった場合、外れた曲名とURLを残す。
+            // ✓ になった後も消さない（何をどう直したか一覧で追えるように）
+            if let Some(fu) = failed_url {
+                if row.failed_url.is_none() {
+                    row.failed_track = Some(row.track.clone());
+                    row.failed_url = Some(fu);
+                }
+            }
+
+            // Geniusが持つ正式なタイトルに寄せる
+            if !info.track.is_empty() {
+                row.track = info.track.clone();
+            }
+
+            row.status = match &resolved {
+                Some(_) => AutoAddStatus::Ok,
+                None => AutoAddStatus::NoArtist,
+            };
+            row.resolved_artist = resolved;
+            row.info = Some(*info);
+            row.genius_url = Some(url);
+        }
+        GeniusCheck::NotFound { tried } => {
+            let row = &mut app.auto_add_rows[idx];
+            row.status = AutoAddStatus::NotFound;
+            row.info = None;
+            row.genius_url = None;
+            row.failed_track = Some(row.track.clone());
+            row.failed_artist = Some(row.artist.clone());
+            row.failed_url = tried.into_iter().next();
+        }
+        GeniusCheck::NetworkError(e) => {
+            let row = &mut app.auto_add_rows[idx];
+            row.status = AutoAddStatus::NetError;
+            row.info = None;
+            let _ = e;
+        }
+    }
+}
+
+/// ワーカーが終了した（txがdropされた）ときの後処理
+pub fn finish_auto_add_scan(app: &mut App) {
+    if app.auto_add_phase == AutoAddPhase::Checking {
+        // 届かなかった行はPendingに戻しておく（rで再試行できる）
+        for row in app.auto_add_rows.iter_mut() {
+            if row.status == AutoAddStatus::Checking {
+                row.status = AutoAddStatus::Pending;
+            }
+        }
+        app.auto_add_phase = AutoAddPhase::Ready;
+    } else if app.auto_add_phase == AutoAddPhase::Fetching {
+        // Likedが来ないまま終了＝キャンセルされた
+        app.auto_add_phase = AutoAddPhase::Empty;
+    }
+}
+
+/// AutoAdd: 実行中か（Esc でキャンセルできる状態か）
+fn auto_add_running(app: &App) -> bool {
+    matches!(
+        app.auto_add_phase,
+        AutoAddPhase::Fetching | AutoAddPhase::Checking
+    )
+}
+
+/// AutoAdd: 走っているワーカーを止める
+fn cancel_auto_add(app: &mut App) {
+    app.auto_add_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.auto_add_rx = None;
+    for row in app.auto_add_rows.iter_mut() {
+        if row.status == AutoAddStatus::Checking {
+            row.status = AutoAddStatus::Pending;
+        }
+    }
+    app.auto_add_phase = if app.auto_add_rows.is_empty() {
+        AutoAddPhase::Empty
+    } else {
+        AutoAddPhase::Ready
+    };
+    app.show_message("Cancelled");
+}
+
+/// AutoAdd: インライン編集を開始（0=Track, 1=Artist）
+fn start_auto_add_edit(app: &mut App, field: usize) {
+    let Some(row) = app.auto_add_rows.get(app.list_index) else {
+        return;
+    };
+    app.edit_buffer = if field == 0 {
+        row.track.clone()
+    } else {
+        row.artist.clone()
+    };
+    app.edit_cursor = app.edit_buffer.chars().count();
+    app.auto_add_editing = Some(field);
+}
+
+/// AutoAdd: 編集内容を行に書き戻し、その行だけ再チェックする
+fn save_auto_add_edit(app: &mut App, recheck: bool) {
+    let Some(field) = app.auto_add_editing else {
+        return;
+    };
+    let Some(row) = app.auto_add_rows.get_mut(app.list_index) else {
+        return;
+    };
+
+    let new_value = app.edit_buffer.trim().to_string();
+    if new_value.is_empty() {
+        return;
+    }
+
+    let changed = if field == 0 {
+        let c = row.track != new_value;
+        // 直す前の値を残す（✓になった後も表示し続ける）
+        if c && row.failed_track.is_none() {
+            row.failed_track = Some(row.track.clone());
+        }
+        row.track = new_value;
+        c
+    } else {
+        let c = row.artist != new_value;
+        if c && row.failed_artist.is_none() {
+            row.failed_artist = Some(row.artist.clone());
+        }
+        row.artist = new_value;
+        c
+    };
+
+    if !changed || !recheck {
+        return;
+    }
+
+    // seqを進めて、先に投げた結果が後から届いても無視されるようにする
+    row.seq += 1;
+    row.status = AutoAddStatus::Checking;
+    row.info = None;
+    row.genius_url = None;
+    row.resolved_artist = None;
+
+    let target = (row.id, row.seq, row.artist.clone(), row.track.clone());
+    app.start_auto_add_check(vec![target]);
+}
+
+/// AutoAdd: インライン編集中のキー処理（ViewLogのアルバム編集と同じ流儀）
+fn handle_auto_add_edit(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.auto_add_editing = None;
+            app.edit_buffer.clear();
+            app.edit_cursor = 0;
+        }
+        KeyCode::Enter => {
+            save_auto_add_edit(app, true);
+            app.auto_add_editing = None;
+            app.edit_buffer.clear();
+            app.edit_cursor = 0;
+        }
+        // Track ⇄ Artist の切り替え。hは全画面で「戻る」なので列カーソルには使わない
+        KeyCode::Tab => {
+            let next = app.auto_add_editing.map(|f| 1 - f).unwrap_or(0);
+            save_auto_add_edit(app, false);
+            start_auto_add_edit(app, next);
+        }
+        KeyCode::Backspace => {
+            if app.edit_cursor > 0 {
+                app.edit_cursor -= 1;
+                remove_char_at(&mut app.edit_buffer, app.edit_cursor);
+            }
+        }
+        KeyCode::Delete => {
+            if app.edit_cursor < app.edit_buffer.chars().count() {
+                remove_char_at(&mut app.edit_buffer, app.edit_cursor);
+            }
+        }
+        KeyCode::Left => {
+            app.edit_cursor = app.edit_cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            if app.edit_cursor < app.edit_buffer.chars().count() {
+                app.edit_cursor += 1;
+            }
+        }
+        KeyCode::Home => app.edit_cursor = 0,
+        KeyCode::End => app.edit_cursor = app.edit_buffer.chars().count(),
+        KeyCode::Char(c) => {
+            let byte_idx = char_to_byte_index(&app.edit_buffer, app.edit_cursor);
+            app.edit_buffer.insert(byte_idx, c);
+            app.edit_cursor += 1;
+        }
+        _ => {}
+    }
+}
+
+/// AutoAdd: カーソル行を候補から外す（credit_dataには触らない）
+fn handle_auto_add_delete(app: &mut App) {
+    if app.auto_add_rows.is_empty() {
+        return;
+    }
+    let row = app.auto_add_rows.remove(app.list_index);
+    if app.list_index >= app.auto_add_rows.len() && app.list_index > 0 {
+        app.list_index -= 1;
+    }
+    app.show_message(&format!("Removed '{}'", row.track));
+}
+
+/// AutoAdd: 全行を再チェック
+fn handle_auto_add_recheck(app: &mut App) {
+    if app.auto_add_rows.is_empty() {
+        return;
+    }
+    for row in app.auto_add_rows.iter_mut() {
+        if row.status == AutoAddStatus::Duplicate {
+            continue;
+        }
+        row.seq += 1;
+        row.status = AutoAddStatus::Pending;
+        row.info = None;
+        row.genius_url = None;
+        row.resolved_artist = None;
+    }
+    start_pending_checks(app);
+}
+
+/// AutoAdd: カーソル行のGeniusページをブラウザで開く
+fn handle_auto_add_open(app: &mut App) {
+    let Some(row) = app.auto_add_rows.get(app.list_index) else {
+        return;
+    };
+    // チェックで当たったURLがあればそれを、まだなら第1候補を開く
+    let url = row
+        .genius_url
+        .clone()
+        .unwrap_or_else(|| make_url(&row.artist, &row.track));
+    match open::that(&url) {
+        Ok(_) => app.show_message(&format!("Opened {}", url)),
+        Err(e) => app.show_error(&format!("Failed to open browser: {}", e)),
+    }
+}
+
+/// AutoAdd: 全行をcredit_dataへ一括追加する。
+/// DB操作はすべてメインスレッドで行う（Arc<Database>はスレッドに渡せない）
+fn handle_auto_add_commit(app: &mut App) {
+    if app.auto_add_rows.is_empty() {
+        app.show_message("No songs to add");
+        return;
+    }
+    if auto_add_running(app) {
+        app.show_error("Still checking - please wait");
+        return;
+    }
+
+    // 未登録アーティストがあれば先に登録してもらう
+    let unregistered: Vec<String> = app
+        .auto_add_rows
+        .iter()
+        .filter(|r| r.status == AutoAddStatus::NoArtist)
+        .map(|r| r.artist.clone())
+        .collect();
+    if !unregistered.is_empty() {
+        let mut names = unregistered.clone();
+        names.dedup();
+        app.show_error(&format!(
+            "Unregistered artist: {} - register in ArtistData first",
+            names.join(", ")
+        ));
+        return;
+    }
+
+    // ✓ と dup 以外が残っていたら追加しない
+    let not_ready = app
+        .auto_add_rows
+        .iter()
+        .filter(|r| !matches!(r.status, AutoAddStatus::Ok | AutoAddStatus::Duplicate))
+        .count();
+    if not_ready > 0 {
+        app.show_error(&format!(
+            "All rows must be OK before adding ({} not ready)",
+            not_ready
+        ));
+        return;
+    }
+
+    // design.md: お気に入りの古い順に追加する。
+    // お気に入りは新しい順で並んでいるので逆順に回す。
+    let mut credits: Vec<CreditData> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut songs = 0usize;
+
+    for row in app.auto_add_rows.iter().rev() {
+        if row.status == AutoAddStatus::Duplicate {
+            continue;
+        }
+        let (Some(artist), Some(info)) = (row.resolved_artist.as_ref(), row.info.as_ref()) else {
+            continue;
+        };
+
+        songs += 1;
+        for credit in &info.credits {
+            credits.push(CreditData {
+                id: None,
+                artist: artist.clone(),
+                label: None,
+                // Geniusが拾えなかった分はSpotify側の情報で補う
+                date: info.date.clone().or_else(|| row.spotify_date.clone()),
+                album: info.album.clone().or_else(|| row.spotify_album.clone()),
+                track: info.track.clone(),
+                role: Some(credit.role.clone()),
+                name: Some(credit.name.clone()),
+                count: None,
+                created_at: None,
+                is_aoty: false,
+                is_soty: false,
+            });
+            if !names.contains(&credit.name) {
+                names.push(credit.name.clone());
+            }
+        }
+    }
+
+    if credits.is_empty() {
+        app.show_message("No songs to add");
+        return;
+    }
+
+    let total = credits.len();
+    if let Err(e) = app.db.insert_credits_batch(&credits) {
+        app.show_error(&format!("Failed to add: {}", e));
+        return;
+    }
+
+    // update_writer_countは毎回全件COUNTするので、クレジット毎ではなく
+    // distinctな名前について1回ずつだけ呼ぶ
+    for name in &names {
+        let _ = app.db.update_writer_count(name);
+    }
+
+    app.auto_add_rows.clear();
+    app.auto_add_phase = AutoAddPhase::Empty;
+    app.show_message(&format!("Added {} songs ({} credits)", songs, total));
 }

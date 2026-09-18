@@ -528,6 +528,74 @@ impl Database {
         Ok(())
     }
 
+    /// 最後にcredit_dataへ入った曲の (artist, track)。
+    /// get_songs_by_log()は全件SELECTするので、1行だけ欲しいときはこちらを使う
+    pub fn get_newest_credit(&self) -> Result<Option<(String, String)>> {
+        let result = self.conn.query_row(
+            "SELECT artist, track FROM credit_data ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// その曲のクレジットが既に入っているか。
+    /// credit_dataにUNIQUE制約がなくinsert_songもON CONFLICTを持たないので、
+    /// 一括追加の前にこれで弾かないと全クレジットが二重化する
+    pub fn credit_exists(&self, artist: &str, track: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM credit_data WHERE artist = ?1 AND track = ?2)",
+            params![artist, track],
+            |row| row.get(0),
+        )?;
+        Ok(n != 0)
+    }
+
+    /// クレジットをまとめて挿入する。1件ずつINSERTするとfsyncが効いて遅いのでトランザクションで包む。
+    /// Appが持つのは Arc<Database> で可変借用が取れないため、
+    /// Connection::transaction() ではなく明示的な BEGIN/COMMIT を使う
+    pub fn insert_credits_batch(&self, songs: &[CreditData]) -> Result<usize> {
+        if songs.is_empty() {
+            return Ok(0);
+        }
+
+        self.conn.execute_batch("BEGIN")?;
+
+        let result = (|| -> Result<()> {
+            let mut stmt = self.conn.prepare(
+                r#"INSERT INTO credit_data (artist, date, album, track, role, name, count)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            )?;
+            for song in songs {
+                stmt.execute(params![
+                    song.artist,
+                    song.date,
+                    song.album,
+                    song.track,
+                    song.role,
+                    song.name,
+                    song.count
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(songs.len())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// 曲データを取得（入力順、新しい順）
     pub fn get_songs_by_log(&self) -> Result<Vec<CreditData>> {
         let mut stmt = self.conn.prepare(

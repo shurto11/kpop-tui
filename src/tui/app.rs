@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use crate::db::Database;
@@ -20,6 +21,7 @@ pub enum Screen {
     MainMenu,
     // Input
     InputMenu,
+    InputAutoAdd,
     InputCreditData,
     InputTrackData,
     InputArtistData,
@@ -178,6 +180,19 @@ pub struct App {
     // ViewLog: アルバム名インライン編集中
     pub editing_log_album: bool,
 
+    // AutoAdd状態
+    pub auto_add_rows: Vec<AutoAddRow>,
+    pub auto_add_phase: AutoAddPhase,
+    pub auto_add_next_id: u64,
+    pub auto_add_rx: Option<mpsc::Receiver<AutoAddMsg>>,
+    /// ワーカーへの中断指示。go_to/go_backと Esc で立てる
+    pub auto_add_cancel: Arc<AtomicBool>,
+    /// インライン編集中のフィールド: 0=Track, 1=Artist
+    pub auto_add_editing: Option<usize>,
+    /// チェック済み件数 / 全体（進捗表示用）
+    pub auto_add_done: usize,
+    pub auto_add_total: usize,
+
     // Quiz状態
     pub quiz_questions: Vec<(String, String, String)>, // (artist, track, spotify_url)
     pub quiz_current: usize,
@@ -185,6 +200,80 @@ pub struct App {
     pub quiz_last_correct: bool,
     pub quiz_last_answer: String,
     pub quiz_last_actual: String,
+}
+
+/// AutoAdd: 各行のGenius確認状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoAddStatus {
+    /// 未チェック
+    Pending,
+    /// チェック中
+    Checking,
+    /// Geniusページあり
+    Ok,
+    /// 全候補URLが404
+    NotFound,
+    /// ネットワークエラー
+    NetError,
+    /// 既にcredit_dataにある
+    Duplicate,
+    /// artist_dataに未登録
+    NoArtist,
+}
+
+/// AutoAdd: 追加候補1曲分
+#[derive(Debug, Clone)]
+pub struct AutoAddRow {
+    /// 安定ID（配列インデックスではない。結果配送に使う）
+    pub id: u64,
+    /// 編集のたびに+1。古い結果を捨てるために使う
+    pub seq: u32,
+    pub track: String,
+    pub artist: String,
+    /// 表示用（複数アーティスト曲）
+    pub artists_all: Vec<String>,
+    pub added_at: String,
+    pub status: AutoAddStatus,
+    /// DBに入れる実際のアーティスト名（Genius名優先で解決したもの）
+    pub resolved_artist: Option<String>,
+    /// チェック成功時のスクレイプ結果。追加時に再取得しないためのキャッシュ
+    pub info: Option<ScrapedSongInfo>,
+    /// 実際に当たったGeniusのURL（候補のうちどれが通ったか）
+    pub genius_url: Option<String>,
+    /// Spotifyから取れたアルバム名（Geniusが拾えなかった場合のフォールバック）
+    pub spotify_album: Option<String>,
+    /// Spotifyから取れたリリース日（同上）
+    pub spotify_date: Option<String>,
+
+    // ✗だったときの値。✓になった後も残して表示する
+    pub failed_track: Option<String>,
+    pub failed_artist: Option<String>,
+    pub failed_url: Option<String>,
+}
+
+/// AutoAdd: 画面の進行状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoAddPhase {
+    Idle,
+    Fetching,
+    Checking,
+    Ready,
+    Empty,
+}
+
+/// AutoAdd: ワーカースレッドからのメッセージ
+#[derive(Debug)]
+pub enum AutoAddMsg {
+    /// お気に入り取得完了
+    Liked(Result<Vec<crate::spotify::LikedTrack>, String>),
+    /// 1行のGenius確認完了
+    Checked {
+        id: u64,
+        seq: u32,
+        result: crate::scraper::GeniusCheck,
+    },
+    /// スキャン全体の中断
+    Aborted(String),
 }
 
 /// TrackDataフィルタ
@@ -350,6 +439,14 @@ impl App {
             pending_delete_index: None,
             log_undo_stack: Vec::new(),
             editing_log_album: false,
+            auto_add_rows: Vec::new(),
+            auto_add_phase: AutoAddPhase::Idle,
+            auto_add_next_id: 0,
+            auto_add_rx: None,
+            auto_add_cancel: Arc::new(AtomicBool::new(false)),
+            auto_add_editing: None,
+            auto_add_done: 0,
+            auto_add_total: 0,
             quiz_questions: Vec::new(),
             quiz_current: 0,
             quiz_score: 0,
@@ -362,12 +459,98 @@ impl App {
     }
 
     /// 画面を遷移
+    /// お気に入り取得をバックグラウンドで開始する。
+    /// DBは触らない（rusqliteのConnectionは!Syncなのでスレッドに渡せない）。
+    pub fn start_auto_add_fetch(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        // 前のワーカーが生きていても新しいフラグに差し替えることで巻き添えを防ぐ
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.auto_add_cancel = Arc::clone(&cancel);
+        self.auto_add_rx = Some(rx);
+        self.auto_add_phase = AutoAddPhase::Fetching;
+
+        std::thread::spawn(move || {
+            let result = crate::spotify::fetch_liked_tracks(&cancel).map_err(|e| e.to_string());
+            let _ = tx.send(AutoAddMsg::Liked(result));
+        });
+    }
+
+    /// 指定した行のGenius確認をバックグラウンドで開始する（チェック／再チェック共通）。
+    /// 結果は id+seq で返ってくるので、途中で行を消しても別の行に結果が付かない。
+    pub fn start_auto_add_check(&mut self, targets: Vec<(u64, u32, String, String)>) {
+        if targets.is_empty() {
+            self.auto_add_phase = AutoAddPhase::Ready;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.auto_add_cancel = Arc::clone(&cancel);
+        self.auto_add_rx = Some(rx);
+        self.auto_add_phase = AutoAddPhase::Checking;
+        self.auto_add_done = 0;
+        self.auto_add_total = targets.len();
+
+        let config = self.config.clone();
+
+        std::thread::spawn(move || {
+            let mut consecutive_net_errors = 0;
+
+            for (id, seq, artist, track) in targets {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let result =
+                    crate::scraper::check_genius_candidates(&artist, &track, &config, &cancel);
+
+                // ネットワークが落ちている状態で全件叩き続けても時間の無駄なので、
+                // 連続で失敗したらスキャンごと打ち切る
+                if matches!(result, crate::scraper::GeniusCheck::NetworkError(_)) {
+                    consecutive_net_errors += 1;
+                } else {
+                    consecutive_net_errors = 0;
+                }
+
+                if tx.send(AutoAddMsg::Checked { id, seq, result }).is_err() {
+                    return;
+                }
+
+                if consecutive_net_errors >= 3 {
+                    let _ = tx.send(AutoAddMsg::Aborted(
+                        "Network error - check your connection".to_string(),
+                    ));
+                    return;
+                }
+
+                // Geniusに連打しない
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        });
+    }
+
+    /// AutoAdd画面から離れるときの後始末。
+    /// ワーカーは receiver を落としただけでは止まらないので、必ずキャンセルフラグを立てる。
+    fn clear_auto_add(&mut self) {
+        self.auto_add_cancel.store(true, Ordering::Relaxed);
+        self.auto_add_rx = None;
+        self.auto_add_rows.clear();
+        self.auto_add_phase = AutoAddPhase::Idle;
+        self.auto_add_editing = None;
+        self.auto_add_done = 0;
+        self.auto_add_total = 0;
+    }
+
     pub fn go_to(&mut self, screen: Screen) {
         // InputTrackData以外に遷移する場合はBPMキャッシュをクリア
         if !matches!(screen, Screen::InputTrackData) {
             self.bpm_receiver = None;
             self.bpm_cache = None;
             self.bpm_cache_artist.clear();
+        }
+        // InputAutoAdd以外に遷移する場合はAutoAdd状態クリア＋ワーカー中断
+        if !matches!(screen, Screen::InputAutoAdd) {
+            self.clear_auto_add();
         }
         // Quiz系以外に遷移する場合はQuiz状態クリア
         if !matches!(screen, Screen::Quiz | Screen::QuizResult | Screen::QuizFinal) {
@@ -412,6 +595,10 @@ impl App {
                 self.bpm_receiver = None;
                 self.bpm_cache = None;
                 self.bpm_cache_artist.clear();
+            }
+            // InputAutoAdd以外に戻る場合はAutoAdd状態クリア＋ワーカー中断
+            if !matches!(prev, Screen::InputAutoAdd) {
+                self.clear_auto_add();
             }
             self.screen = prev;
             self.menu_index = saved_menu_index;
@@ -461,6 +648,10 @@ impl App {
                 },
             ],
             Screen::InputMenu => vec![
+                MenuItem {
+                    label: "AutoAdd".to_string(),
+                    screen: Screen::InputAutoAdd,
+                },
                 MenuItem {
                     label: "CreditData".to_string(),
                     screen: Screen::InputCreditData,
@@ -717,6 +908,17 @@ impl App {
                 self.suggestions = self.db.get_credit_names().unwrap_or_default();
                 self.suggestion_index = 0;
             }
+            Screen::InputAutoAdd => {
+                // 画面に入るたびに取り直す。前回のワーカーは go_to 側で中断済み
+                self.auto_add_rows.clear();
+                self.auto_add_editing = None;
+                self.auto_add_done = 0;
+                self.auto_add_total = 0;
+                self.list_index = 0;
+                self.list_offset = 0;
+                self.mode = Mode::Normal;
+                self.start_auto_add_fetch();
+            }
             Screen::InputWriterAka => {
                 self.aka_pairs = compute_aka_pairs(&self.db);
                 self.list_index = 0;
@@ -847,6 +1049,7 @@ impl App {
             Screen::ViewArtistData => self.artists.len(),
             Screen::ViewWriterData => self.writers.len(),
             Screen::InputWriterAka => self.aka_pairs.len(),
+            Screen::InputAutoAdd => self.auto_add_rows.len(),
             Screen::SearchWriterResult { .. } | Screen::SearchTrackResult { .. } => {
                 self.search_results.len()
             }

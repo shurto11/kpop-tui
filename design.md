@@ -333,3 +333,66 @@ path = "kpop.db"
 - 曲自体を削除もできるように
 - 全部マルになったら、ユーザーがEnterを押すとDataに追加
 - 追加する際は、お気に入りの古い順に追加
+
+### 実装 (Input > AutoAdd)
+
+#### Spotify連携
+認証は**spotatuiに任せ、kpop-tuiは読むだけ**。取得の直前に `spotatui list --liked --limit 1`
+を呼んで期限切れならspotatui自身にリフレッシュさせ、`~/.config/spotatui/.spotify_token_cache*.json`
+（mtime最新）から access_token を読む。**認証ファイルへの書き戻しはしない**
+（PKCEのrefresh_tokenはローテーションするため、書き戻すとspotatui側の認証が壊れ得る）。
+取得は `GET /v1/me/tracks` を `next` で辿って全件（limitの上限は50）。追加クレートは不要。
+
+#### Genius URL の候補
+Spotifyの曲名・アーティスト名はそのままではGeniusのスラッグに合わないため、
+段階的に削って**最大5本**試し、最初に200が返ったものを採用する。
+
+| # | 変換 | 例 |
+|---|------|-----|
+| 1 | そのまま | |
+| 2 | アーティストの括弧を削除 | `ALL(H)OURS` → `allhours` |
+| 3 | `(feat. X)` を除去 | |
+| 4 | 曲名の ` - ...` 以降を除去 | `SIGN - Japanese Ver.` → `SIGN` |
+| 5 | 末尾の括弧グループを除去 | `Touch (Y2K Unit)` → `Touch` |
+| 6 | 主アーティストのみ | `A & B` → `A` |
+| — | 各候補でアクセント除去も試す | `México` → `mexico` |
+
+#### 画面の状態と操作
+| キー | 動作 |
+|------|------|
+| `j`/`k` | 行移動 |
+| `e` | Trackをインライン編集（編集中の `Tab` でArtistへ） |
+| `d` | 行を候補から外す（DBには触らない） |
+| `r` | 全行を再チェック |
+| `o` | 当たったGeniusページをブラウザで開く |
+| `Enter` | 全行をcredit_dataへ一括追加 |
+| `Esc` | 取得・チェック中なら中断、そうでなければ戻る |
+
+行のマーク: `[✓]` あり / `[✗]` 全候補が404 / `[!]` ネットワークエラー /
+`[dup]` 既にcredit_dataにある / `[✗] artist not registered` artist_data未登録。
+
+**✗ だった値は ✓ になっても消さない。** 手で直した場合も候補URLの自動リトライで当たった場合も、
+外れた曲名（名前が変わっていなければ外れたURLのスラッグ）を `✗ was: ...` として行に残す。
+
+#### 安全策
+- artist_dataに未登録のアーティストが1つでもあれば、Enterでの一括追加を**ブロック**する。
+  判定は必ずGenius側の名前で行う（実際にDBへ入るのがその名前のため）。
+- credit_dataにはUNIQUE制約がないので、候補を作る時点で `credit_exists` を全行に走らせ
+  既存曲を `[dup]` にして追加対象から外す。「log最新1曲で切る」判定が、後から古い曲を
+  手動で足したときに崩れる弱点の安全弁になっている。
+- 追加はトランザクションで一括INSERTし、`update_writer_count` は
+  distinctなライター名について1回ずつだけ呼ぶ（クレジット毎に呼ぶと実質O(n²)）。
+- Geniusが date / album を拾えなかった行は、Spotifyの `album.name` / `album.release_date` で補う。
+
+#### 実装上の制約
+- **DB操作はすべてメインスレッド。** `rusqlite::Connection` は `!Sync` なので
+  `Arc<Database>` をワーカーに渡せない。ワーカーはHTTPとプロセス実行のみ。
+- **`app.loading` は使わない。** `loading` 中は `Esc` 以外の全キーが捨てられるため、
+  逐次○×更新しながら操作する画面と両立しない。進行は `auto_add_phase` と行ごとのスピナーで見せる。
+- 結果の配送は配列インデックスではなく**行の安定ID + seq**で行う。
+  これがないとスキャン中の削除・編集で別の行に○×が付く。
+- ワーカーは `Arc<AtomicBool>` で中断できるようにし、`go_to`/`go_back`/`Esc` で必ず立てる。
+- `scrape_genius` にステータスコード判定とタイムアウトを追加した。
+  Geniusは存在しない曲にも404と一緒に長いHTMLを返すため、ステータスを見ないと
+  404ページのタイトルから偽のartist/trackを拾う。
+- `spotatui` の呼び出しには自前で15秒の上限を設ける（spotatui側にネットワークタイムアウトがない）。

@@ -1,6 +1,7 @@
 mod db;
 mod models;
 mod scraper;
+mod spotify;
 mod tui;
 
 use std::io;
@@ -17,7 +18,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use db::Database;
 use models::Config;
-use tui::{app::App, input::{handle_key, process_bpm_result, process_scrape_result, tick_bpm_pending, quiz_auto_play}, ui::draw};
+use tui::{app::App, input::{finish_auto_add_scan, handle_key, process_auto_add_msg, process_bpm_result, process_scrape_result, tick_bpm_pending, quiz_auto_play}, ui::draw};
 
 fn main() -> Result<()> {
     // 設定ファイルのパス
@@ -187,6 +188,29 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     app.spotify_playing = false;
                     app.show_error("Spotify process disconnected");
                 }
+            }
+        }
+
+        // AutoAdd受信チェック。
+        // 1ループ1件だとevent::poll(100ms)に律速されて進捗が実際より数秒遅れて見えるので、
+        // 溜まっている分をまとめて吸い出す。
+        if app.auto_add_rx.is_some() {
+            let mut disconnected = false;
+            loop {
+                let msg = match app.auto_add_rx.as_ref().unwrap().try_recv() {
+                    Ok(m) => m,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
+                process_auto_add_msg(app, msg);
+            }
+            // ワーカーが送り終えてtxをdropした＝正常終了。エラーではない
+            if disconnected {
+                app.auto_add_rx = None;
+                finish_auto_add_scan(app);
             }
         }
 
