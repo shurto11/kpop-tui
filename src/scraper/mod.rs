@@ -72,7 +72,7 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
     ))
     .map_err(|e| anyhow::anyhow!("Invalid artist selector: {:?}", e))?;
 
-    let artist = document
+    let mut artist = document
         .select(&artist_selector)
         .next()
         .map(|el| el.text().collect::<String>().trim().to_string())
@@ -85,7 +85,7 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
     ))
     .map_err(|e| anyhow::anyhow!("Invalid title selector: {:?}", e))?;
 
-    let track = document
+    let mut track = document
         .select(&title_selector)
         .next()
         .map(|el| el.text().collect::<String>().trim().to_string())
@@ -122,7 +122,7 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
     };
 
     // アルバム名
-    let album_selector = Selector::parse("a[href=\"#primary-album\"].StyledLink-sc-15c685a-0")
+    let album_selector = Selector::parse("a[href=\"#primary-album\"]")
         .map_err(|e| anyhow::anyhow!("Invalid album selector: {:?}", e))?;
 
     let album = document
@@ -235,7 +235,57 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
     credits.sort_by_key(|c| role_order(&c.role));
 
     if artist.is_empty() || track.is_empty() {
-        anyhow::bail!("Failed to extract artist or track name from page");
+        // Fallback: try meta[property="og:title"] content or <title> tag to derive artist and track.
+        let title_meta_sel = Selector::parse("meta[property=\"og:title\"]").ok();
+        if let Some(sel) = title_meta_sel {
+            if let Some(content) = document.select(&sel).next().and_then(|e| e.value().attr("content")) {
+                let mut s = content.trim().to_string();
+                // Remove trailing " | Genius" or " Lyrics"
+                if let Some(pos) = s.rfind(" | Genius") { s.truncate(pos); }
+                if s.to_lowercase().ends_with(" lyrics") {
+                    s.truncate(s.len().saturating_sub(7));
+                    s = s.trim().to_string();
+                }
+                // Try splitting by common separators
+                let seps = [" – ", " — ", " - ", "—", "–", " - "];
+                let mut parts: Vec<&str> = Vec::new();
+                for sep in &seps {
+                    if s.contains(sep) {
+                        parts = s.splitn(2, sep).collect();
+                        break;
+                    }
+                }
+                if parts.is_empty() {
+                    parts = s.splitn(2, " - ").collect();
+                }
+                if artist.is_empty() { artist = parts.get(0).map(|p| p.trim().to_string()).unwrap_or_default(); }
+                if track.is_empty() { track = parts.get(1).map(|p| p.trim().to_string()).unwrap_or_default(); }
+            }
+        }
+
+        // Another fallback: <title> tag
+        if (artist.is_empty() || track.is_empty()) {
+            if let Some(title_el) = document.select(&Selector::parse("title").unwrap()).next() {
+                let mut s = title_el.text().collect::<String>().trim().to_string();
+                if let Some(pos) = s.rfind(" | Genius") { s.truncate(pos); }
+                if s.to_lowercase().ends_with(" lyrics") { s.truncate(s.len().saturating_sub(7)); s = s.trim().to_string(); }
+                let seps = [" – ", " — ", " - ", "—", "–", " - "];
+                let mut parts: Vec<&str> = Vec::new();
+                for sep in &seps {
+                    if s.contains(sep) {
+                        parts = s.splitn(2, sep).collect();
+                        break;
+                    }
+                }
+                if parts.is_empty() { parts = s.splitn(2, " - ").collect(); }
+                if artist.is_empty() { artist = parts.get(0).map(|p| p.trim().to_string()).unwrap_or_default(); }
+                if track.is_empty() { track = parts.get(1).map(|p| p.trim().to_string()).unwrap_or_default(); }
+            }
+        }
+
+        if artist.is_empty() || track.is_empty() {
+            anyhow::bail!("Failed to extract artist or track name from page");
+        }
     }
 
     Ok(ScrapedSongInfo {
@@ -432,6 +482,20 @@ fn parse_songbpm_html(html: &str, _artist: &str) -> Result<(Vec<BpmTrackInfo>, O
     Ok((tracks, next_url))
 }
 
+/// アーティスト名を正規化（括弧内韓国語の除去・残存韓国語文字の除去）
+/// 例: "Billlie (빌리)" → "Billlie", "(G)I-DLE" → "(G)I-DLE"（韓国語のない括弧は保持）
+pub fn normalize_artist_name(name: &str) -> String {
+    // 括弧内に韓国語が1文字以上含まれるグループを除去
+    let re = Regex::new(r"\s*[\(\[（【][^\)\]）】]*[\u{AC00}-\u{D7A3}][^\)\]）】]*[\)\]）】]").unwrap();
+    let result = re.replace_all(name, "");
+    // 残った韓国語文字（ハングル音節ブロック）を除去
+    let result: String = result
+        .chars()
+        .filter(|c| !('\u{AC00}'..='\u{D7A3}').contains(c))
+        .collect();
+    result.trim().to_string()
+}
+
 /// トラック名をマッチング用に正規化
 pub fn normalize_track_name(name: &str) -> String {
     let mut result = name.to_lowercase();
@@ -564,6 +628,15 @@ fn urlencoding_manual(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_artist_name() {
+        assert_eq!(normalize_artist_name("Billlie (빌리)"), "Billlie");
+        assert_eq!(normalize_artist_name("Billlie"), "Billlie");
+        assert_eq!(normalize_artist_name("IVE 아이브"), "IVE");
+        assert_eq!(normalize_artist_name("(G)I-DLE"), "(G)I-DLE");
+        assert_eq!(normalize_artist_name("aespa [에스파]"), "aespa");
+    }
 
     #[test]
     fn test_clean_text() {

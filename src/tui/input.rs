@@ -38,21 +38,30 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // ViewLog: アルバム名インライン編集
+    if app.editing_log_album {
+        handle_log_album_edit(app, key);
+        return;
+    }
+
     // ViewLog: 削除確認待ち (y/n)
-    if let Some(idx) = app.pending_delete_index {
+    if let Some(_idx) = app.pending_delete_index {
         match key.code {
             KeyCode::Char('y') => {
-                if let Some(credit) = app.credits.get(idx).cloned() {
-                    if let Some(id) = credit.id {
-                        if let Err(e) = app.db.delete_credit_by_id(id) {
-                            app.show_error(&format!("Delete failed: {}", e));
-                        } else {
-                            app.credits.remove(idx);
-                            app.log_undo_stack.push(credit);
+                if let Some(credit) = app.credits.get(_idx).cloned() {
+                    match app.db.delete_credits_by_artist_track(&credit.artist, &credit.track) {
+                        Ok(deleted) => {
+                            for d in deleted {
+                                app.log_undo_stack.push(d);
+                            }
+                            app.credits.retain(|c| !(c.artist == credit.artist && c.track == credit.track));
                             if app.list_index >= app.credits.len() && app.list_index > 0 {
                                 app.list_index -= 1;
                             }
                             app.show_message("Deleted");
+                        }
+                        Err(e) => {
+                            app.show_error(&format!("Delete failed: {}", e));
                         }
                     }
                 }
@@ -284,7 +293,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => {
             if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
                 let c = &app.credits[app.list_index];
-                app.show_message(&format!("Delete '{} - {}'? (y/n)", c.artist, c.track));
+                app.show_message(&format!("Delete ALL records for '{} - {}'? (y/n)", c.artist, c.track));
                 app.pending_delete_index = Some(app.list_index);
             } else if matches!(app.screen, Screen::InputWriterAka) && !app.aka_pairs.is_empty() {
                 handle_writer_aka_dismiss(app);
@@ -376,7 +385,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // View → Input に遷移（編集）
         KeyCode::Char('e') => {
-            if matches!(app.screen, Screen::ViewArtistData) && !app.artists.is_empty() {
+            if matches!(app.screen, Screen::ViewLog) && !app.credits.is_empty() {
+                let c = &app.credits[app.list_index];
+                app.edit_buffer = c.album.clone().unwrap_or_default();
+                app.edit_cursor = app.edit_buffer.chars().count();
+                app.editing_log_album = true;
+            } else if matches!(app.screen, Screen::ViewArtistData) && !app.artists.is_empty() {
                 let artist = app.artists[app.list_index].clone();
                 app.go_to(Screen::InputArtistData);
                 app.form_fields[0].value = artist.artist.clone();
@@ -444,6 +458,33 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 app.form_index = 0;
                 app.mode = Mode::Normal;
                 app.suggestions.clear();
+            } else if let Screen::SearchWriterResult { name } = app.screen.clone() {
+                // エイリアスならprimary nameに解決してwriter_dataを取得
+                let primary = app.db.get_primary_name(&name).unwrap_or_else(|_| name.clone());
+                let w = app.db.get_writer(&primary).unwrap_or(None);
+                app.go_to(Screen::InputWriterData);
+                if !app.form_fields.is_empty() {
+                    app.form_fields[0].value = primary.clone();
+                    app.form_fields[0].cursor = primary.chars().count();
+                }
+                if let Some(w) = w {
+                    let rest = [
+                        w.real_name.unwrap_or_default(),
+                        w.birth_date.unwrap_or_default(),
+                        w.birth_place.unwrap_or_default(),
+                        w.occupation.unwrap_or_default(),
+                        w.agency.unwrap_or_default(),
+                        w.debut.unwrap_or_default(),
+                        w.memo.unwrap_or_default(),
+                    ];
+                    for (i, val) in rest.iter().enumerate() {
+                        if i + 1 < app.form_fields.len() {
+                            app.form_fields[i + 1].value = val.clone();
+                            app.form_fields[i + 1].cursor = val.chars().count();
+                        }
+                    }
+                }
+                app.form_index = 1; // RealNameにカーソル
             }
         }
 
@@ -1068,6 +1109,63 @@ fn save_artist_edit(app: &mut App) {
             }
         }
     }
+}
+
+/// ViewLog: アルバム名インライン編集
+fn handle_log_album_edit(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            save_log_album_edit(app);
+            app.editing_log_album = false;
+        }
+        KeyCode::Esc => {
+            app.editing_log_album = false;
+            app.edit_buffer.clear();
+            app.edit_cursor = 0;
+        }
+        KeyCode::Char(c) => {
+            let byte_idx = char_to_byte_index(&app.edit_buffer, app.edit_cursor);
+            app.edit_buffer.insert(byte_idx, c);
+            app.edit_cursor += 1;
+        }
+        KeyCode::Backspace => {
+            if app.edit_cursor > 0 {
+                app.edit_cursor -= 1;
+                remove_char_at(&mut app.edit_buffer, app.edit_cursor);
+            }
+        }
+        KeyCode::Left => {
+            app.edit_cursor = app.edit_cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            if app.edit_cursor < app.edit_buffer.chars().count() {
+                app.edit_cursor += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn save_log_album_edit(app: &mut App) {
+    if let Some(credit) = app.credits.get(app.list_index).cloned() {
+        let new_album: Option<&str> = if app.edit_buffer.is_empty() { None } else { Some(&app.edit_buffer) };
+        match app.db.update_album_by_artist_track(&credit.artist, &credit.track, new_album) {
+            Ok(()) => {
+                let new_album_owned: Option<String> = if app.edit_buffer.is_empty() { None } else { Some(app.edit_buffer.clone()) };
+                for c in &mut app.credits {
+                    if c.artist == credit.artist && c.track == credit.track {
+                        c.album = new_album_owned.clone();
+                    }
+                }
+                app.show_message("Album updated");
+            }
+            Err(e) => {
+                app.show_error(&format!("Failed to update album: {}", e));
+            }
+        }
+    }
+    app.edit_buffer.clear();
+    app.edit_cursor = 0;
 }
 
 /// Suggestions選択モード（インサートモード中にCtrl+pで入る）
@@ -2354,15 +2452,32 @@ fn start_spotify_play(app: &mut App, url: &str) {
 pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, String>) {
     match result {
         Ok(info) => {
-            // アーティストデータを確認
-            let artist_not_found = app.db.get_artist(&info.artist).ok().flatten().is_none();
+            // Genius からのアーティスト名を正規化
+            let genius_artist = crate::scraper::normalize_artist_name(&info.artist);
+
+            // フォームに入力されたアーティスト名（DBの登録名と一致する可能性が高い）
+            let form_artist = app.form_fields.get(0)
+                .map(|f| f.value.trim().to_string())
+                .unwrap_or_default();
+
+            // Genius名 → フォーム入力名の順でDBを照合し、使用するアーティスト名を決定
+            let (artist, artist_not_found) =
+                if app.db.get_artist(&genius_artist).ok().flatten().is_some() {
+                    (genius_artist, false)
+                } else if !form_artist.is_empty()
+                    && app.db.get_artist(&form_artist).ok().flatten().is_some()
+                {
+                    (form_artist, false)
+                } else {
+                    (genius_artist, true)
+                };
 
             // クレジットごとにCreditDataを挿入
             let mut inserted = 0;
             for credit in &info.credits {
                 let song = CreditData {
                     id: None,
-                    artist: info.artist.clone(),
+                    artist: artist.clone(),
                     label: None,
                     date: info.date.clone(),
                     album: info.album.clone(),
@@ -2385,12 +2500,11 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
 
             // アーティストがDBにない場合、ArtistData画面に遷移
             if artist_not_found {
-                let artist_name = info.artist.clone();
                 app.go_to(Screen::InputArtistData);
                 // go_toでform_fieldsが初期化された後にアーティスト名を自動入力
                 if !app.form_fields.is_empty() {
-                    app.form_fields[0].value = artist_name.clone();
-                    app.form_fields[0].cursor = artist_name.chars().count();
+                    app.form_fields[0].value = artist.clone();
+                    app.form_fields[0].cursor = artist.chars().count();
                 }
                 // Labelフィールドにカーソルを置いてInsertモード
                 app.form_index = 1;
@@ -2399,7 +2513,7 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
                 // go_toがmessageをクリアするので、遷移後にメッセージをセット
                 app.show_message(&format!(
                     "Added {} credits for '{}'.{} New artist '{}' - please register.",
-                    inserted, info.track, date_warn, artist_name
+                    inserted, info.track, date_warn, artist
                 ));
                 return;
             }

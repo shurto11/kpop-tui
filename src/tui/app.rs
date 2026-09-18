@@ -175,6 +175,8 @@ pub struct App {
     pub pending_delete_index: Option<usize>,
     // ViewLog: 削除Undo用スタック
     pub log_undo_stack: Vec<CreditData>,
+    // ViewLog: アルバム名インライン編集中
+    pub editing_log_album: bool,
 
     // Quiz状態
     pub quiz_questions: Vec<(String, String, String)>, // (artist, track, spotify_url)
@@ -347,6 +349,7 @@ impl App {
             is_random_fallback: false,
             pending_delete_index: None,
             log_undo_stack: Vec::new(),
+            editing_log_album: false,
             quiz_questions: Vec::new(),
             quiz_current: 0,
             quiz_score: 0,

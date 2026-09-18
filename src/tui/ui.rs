@@ -331,7 +331,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q: Quit"
                 }
                 Screen::ViewLog => {
-                    "j/k: Move  l: Writer  d: Delete  r: Rewind  /: Search  c: Play  h: Back  q: Menu"
+                    if app.editing_log_album {
+                        "Enter: Save  Esc: Cancel  ←→: Cursor  BS: Delete"
+                    } else {
+                        "j/k: Move  e: Edit Album  d: Delete Song  r: Rewind  l: Writer  /: Search  c: Play  h: Back"
+                    }
                 }
                 Screen::ViewCreditData => {
                     "j/k: Move  l: Writer  /: Search  h: Back  q: Menu  Q: Quit"
@@ -346,7 +350,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "j/k: Move  l: Songs  e: Edit  /: Search  h: Back  q: Menu  Q: Quit"
                 }
                 Screen::SearchWriterResult { .. } => {
-                    "j/k: Move  l: Detail  c: Play  /: Search  h: Back  q: Menu  Q: Quit"
+                    "j/k: Move  l: Detail  e: Edit Writer  c: Play  /: Search  h: Back  q: Menu  Q: Quit"
                 }
                 Screen::SearchTrackResult { .. } => {
                     "j/k: Move  l: Writer  c: Play  x: Pause  /: Search  h: Back  q: Menu  Q: Quit"
@@ -1047,7 +1051,11 @@ fn draw_song_table(frame: &mut Frame, app: &App, area: Rect) {
             let actual_index = app.list_offset + i;
             let style = row_style(app, actual_index);
             let role_str = song.role.clone().unwrap_or_default();
-            let album_cell = if song.is_aoty {
+            let is_editing_album = app.editing_log_album && actual_index == app.list_index;
+            let album_cell = if is_editing_album {
+                Cell::from(format!(">{}", app.edit_buffer))
+                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else if song.is_aoty {
                 Cell::from(song.album.clone().unwrap_or_default()).style(Style::default().fg(GOLD))
             } else {
                 Cell::from(song.album.clone().unwrap_or_default())

@@ -6,3 +6,4 @@ config.toml
 kpop3/
 archive/
 backup/
+kpop_backup_*.sql

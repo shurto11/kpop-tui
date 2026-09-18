@@ -113,6 +113,9 @@ impl Database {
         // マイグレーション: genres カラム追加
         self.migrate_add_genres()?;
 
+        // マイグレーション: アーティスト名正規化（括弧内韓国語除去）
+        self.migrate_normalize_artist_names()?;
+
         Ok(())
     }
 
@@ -224,6 +227,83 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// アーティスト名を正規化（括弧内韓国語除去・残存韓国語除去）
+    /// scraper::normalize_artist_name と同じロジックをインライン実装し、モジュール間依存を避ける
+    fn normalize_artist_inline(name: &str) -> String {
+        let re = regex::Regex::new(
+            r"\s*[\(\[（【][^\)\]）】]*[\u{AC00}-\u{D7A3}][^\)\]）】]*[\)\]）】]"
+        ).unwrap();
+        let result = re.replace_all(name, "");
+        let result: String = result
+            .chars()
+            .filter(|c| !('\u{AC00}'..='\u{D7A3}').contains(c))
+            .collect();
+        result.trim().to_string()
+    }
+
+    /// 既存データのアーティスト名を一括正規化（起動時マイグレーション）
+    fn migrate_normalize_artist_names(&self) -> Result<()> {
+        // 全テーブルの distinct artist 名を収集
+        let all_artists: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT artist FROM credit_data
+                 UNION
+                 SELECT DISTINCT artist FROM track_data
+                 UNION
+                 SELECT DISTINCT artist FROM artist_data",
+            )?;
+            let result: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            result
+        };
+
+        for old_name in all_artists {
+            let new_name = Self::normalize_artist_inline(&old_name);
+            if new_name == old_name {
+                continue;
+            }
+
+            // credit_data: UNIQUE制約なし → 単純UPDATE
+            self.conn.execute(
+                "UPDATE credit_data SET artist = ?1 WHERE artist = ?2",
+                params![new_name, old_name],
+            )?;
+
+            // track_data: UNIQUE(track, artist) → OR IGNORE で衝突行をスキップ、残りを削除
+            self.conn.execute(
+                "UPDATE OR IGNORE track_data SET artist = ?1 WHERE artist = ?2",
+                params![new_name, old_name],
+            )?;
+            self.conn.execute(
+                "DELETE FROM track_data WHERE artist = ?1",
+                params![old_name],
+            )?;
+
+            // artist_data: UNIQUE(artist) → new_name が既存なら old を削除、なければ UPDATE
+            let new_exists: bool = self.conn.query_row(
+                "SELECT COUNT(*) > 0 FROM artist_data WHERE artist = ?1",
+                params![new_name],
+                |row| row.get(0),
+            ).unwrap_or(false);
+
+            if new_exists {
+                self.conn.execute(
+                    "DELETE FROM artist_data WHERE artist = ?1",
+                    params![old_name],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE artist_data SET artist = ?1 WHERE artist = ?2",
+                    params![new_name, old_name],
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -426,6 +506,25 @@ impl Database {
     /// credit_dataを1件削除（id指定）
     pub fn delete_credit_by_id(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM credit_data WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// artist+trackで全クレジットを削除（undo用に削除前のデータを返す）
+    pub fn delete_credits_by_artist_track(&self, artist: &str, track: &str) -> Result<Vec<CreditData>> {
+        let deleted = self.search_song(artist, track)?;
+        self.conn.execute(
+            "DELETE FROM credit_data WHERE artist = ?1 AND track = ?2",
+            params![artist, track],
+        )?;
+        Ok(deleted)
+    }
+
+    /// artist+trackの全レコードのalbumを更新
+    pub fn update_album_by_artist_track(&self, artist: &str, track: &str, album: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE credit_data SET album = ?1 WHERE artist = ?2 AND track = ?3",
+            params![album, artist, track],
+        )?;
         Ok(())
     }
 
