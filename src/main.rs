@@ -100,6 +100,19 @@ fn main() -> Result<()> {
         eprintln!("Backup failed: {}", e);
     }
 
+    // 終了時にSQLダンプをkpop-tui-dataリポジトリへpush（変更があるときのみ）
+    let backup_script = get_data_dir().join("scripts").join("backup-data.sh");
+    if backup_script.exists() {
+        match std::process::Command::new(&backup_script)
+            .env("KPOP_DB", &db_path)
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("Data backup failed: {}", s),
+            Err(e) => eprintln!("Data backup failed: {}", e),
+        }
+    }
+
     Ok(())
 }
 
