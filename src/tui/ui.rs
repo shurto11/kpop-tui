@@ -998,7 +998,7 @@ fn draw_auto_add(frame: &mut Frame, app: &App, area: Rect) {
 
             if row.status == AutoAddStatus::NoArtist {
                 spans.push(Span::styled(
-                    "  artist not registered",
+                    "  artist not registered (Enter to register)",
                     Style::default().fg(Color::Red),
                 ));
             }

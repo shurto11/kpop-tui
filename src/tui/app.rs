@@ -541,6 +541,30 @@ impl App {
         self.auto_add_total = 0;
     }
 
+    /// AutoAdd: NoArtistの行をDBと照合し直す（Geniusは叩かない。infoはキャッシュ済み）
+    pub fn refresh_auto_add_artists(&mut self) {
+        for row in self.auto_add_rows.iter_mut() {
+            if row.status != AutoAddStatus::NoArtist {
+                continue;
+            }
+            let Some(info) = row.info.as_ref() else {
+                continue;
+            };
+            let genius_artist = crate::scraper::normalize_artist_name(&info.artist);
+            let resolved = if self.db.get_artist(&genius_artist).ok().flatten().is_some() {
+                Some(genius_artist)
+            } else if self.db.get_artist(&row.artist).ok().flatten().is_some() {
+                Some(row.artist.clone())
+            } else {
+                None
+            };
+            if resolved.is_some() {
+                row.status = AutoAddStatus::Ok;
+                row.resolved_artist = resolved;
+            }
+        }
+    }
+
     pub fn go_to(&mut self, screen: Screen) {
         // InputTrackData以外に遷移する場合はBPMキャッシュをクリア
         if !matches!(screen, Screen::InputTrackData) {
@@ -548,8 +572,11 @@ impl App {
             self.bpm_cache = None;
             self.bpm_cache_artist.clear();
         }
-        // InputAutoAdd以外に遷移する場合はAutoAdd状態クリア＋ワーカー中断
-        if !matches!(screen, Screen::InputAutoAdd) {
+        // InputAutoAdd以外に遷移する場合はAutoAdd状態クリア＋ワーカー中断。
+        // ただしAutoAddから未登録アーティストの登録に行く場合は、戻ってきて続きをやるので残す
+        let auto_add_to_artist = matches!(self.screen, Screen::InputAutoAdd)
+            && matches!(screen, Screen::InputArtistData);
+        if !matches!(screen, Screen::InputAutoAdd) && !auto_add_to_artist {
             self.clear_auto_add();
         }
         // Quiz系以外に遷移する場合はQuiz状態クリア
@@ -907,6 +934,11 @@ impl App {
                 // Nameフィールド用にライター名をロード
                 self.suggestions = self.db.get_credit_names().unwrap_or_default();
                 self.suggestion_index = 0;
+            }
+            Screen::InputAutoAdd if !self.auto_add_rows.is_empty() => {
+                // InputArtistDataから戻ってきた: 取り直さず、未登録だった行だけ判定し直す
+                self.mode = Mode::Normal;
+                self.refresh_auto_add_artists();
             }
             Screen::InputAutoAdd => {
                 // 画面に入るたびに取り直す。前回のワーカーは go_to 側で中断済み

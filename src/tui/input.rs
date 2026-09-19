@@ -1530,6 +1530,27 @@ fn handle_confirm(app: &mut App) {
 
                 match app.db.upsert_artist(&data) {
                     Ok(_) => {
+                        // AutoAddから来た場合はそのまま戻る（戻り先で未登録行を判定し直す）
+                        if matches!(app.screen_stack.last(), Some((Screen::InputAutoAdd, ..))) {
+                            app.go_back();
+                            let remaining = app
+                                .auto_add_rows
+                                .iter()
+                                .filter(|r| r.status == AutoAddStatus::NoArtist)
+                                .count();
+                            if remaining > 0 {
+                                app.show_message(&format!(
+                                    "Artist '{}' saved - {} unregistered left (Enter to register)",
+                                    artist, remaining
+                                ));
+                            } else {
+                                app.show_message(&format!(
+                                    "Artist '{}' saved - Enter to add",
+                                    artist
+                                ));
+                            }
+                            return;
+                        }
                         app.show_message(&format!("Artist '{}' saved", artist));
                         for field in &mut app.form_fields {
                             field.value.clear();
@@ -2979,19 +3000,38 @@ fn handle_auto_add_commit(app: &mut App) {
         return;
     }
 
-    // 未登録アーティストがあれば先に登録してもらう
-    let unregistered: Vec<String> = app
+    // 未登録アーティストがあれば、そのままInputArtistDataで登録してもらう。
+    // AutoAddの状態は残したまま遷移し、保存すると戻ってくる
+    if let Some(idx) = app
         .auto_add_rows
         .iter()
-        .filter(|r| r.status == AutoAddStatus::NoArtist)
-        .map(|r| r.artist.clone())
-        .collect();
-    if !unregistered.is_empty() {
-        let mut names = unregistered.clone();
-        names.dedup();
-        app.show_error(&format!(
-            "Unregistered artist: {} - register in ArtistData first",
-            names.join(", ")
+        .position(|r| r.status == AutoAddStatus::NoArtist)
+    {
+        app.list_index = idx;
+        let row = &app.auto_add_rows[idx];
+        // DBに入るのはGenius名なので、それで登録する
+        let artist = row
+            .info
+            .as_ref()
+            .map(|i| crate::scraper::normalize_artist_name(&i.artist))
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| row.artist.clone());
+        let track = row.track.clone();
+        let remaining = app
+            .auto_add_rows
+            .iter()
+            .filter(|r| r.status == AutoAddStatus::NoArtist)
+            .count();
+
+        app.go_to(Screen::InputArtistData);
+        app.form_fields[0].value = artist.clone();
+        app.form_fields[0].cursor = artist.chars().count();
+        app.form_index = 1; // Labelにカーソル
+        app.mode = Mode::Insert;
+        app.suggestions.clear();
+        app.show_message(&format!(
+            "New artist '{}' ({}) - please register. [{} unregistered]",
+            artist, track, remaining
         ));
         return;
     }
