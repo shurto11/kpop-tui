@@ -319,20 +319,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => {
             match &app.screen {
                 Screen::MainMenu => {
-                    "j/k: Move  l/Enter: Select  c: Play  x: Pause  Q: Quit"
+                    "j/k: Move  l/Enter: Select  c: Play  x: Pause  Q/^C: Quit"
                 }
                 Screen::InputMenu | Screen::SearchMenu | Screen::ViewMenu => {
-                    "j/k: Move  l/Enter: Select  h/Esc: Back  q: Menu  Q: Quit"
+                    "j/k: Move  l/Enter: Select  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputCreditData | Screen::InputArtistData
                 | Screen::InputWriterData | Screen::SearchWriter | Screen::SearchTrack => {
-                    "i: Insert  h/Esc: Back  q: Menu  Q: Quit"
+                    "i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputTrackData => {
-                    "l: Select  a: Next BPM  i: Insert  h/Esc: Back  q: Menu  Q: Quit"
+                    "l: Select  a: Next BPM  i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputWriterAka => {
-                    "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q: Quit"
+                    "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputAutoAdd => {
                     if app.auto_add_editing.is_some() {
@@ -353,7 +353,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     }
                 }
                 Screen::ViewCreditData => {
-                    "j/k: Move  l: Writer  /: Search  h: Back  q: Menu  Q: Quit"
+                    "j/k: Move  l: Writer  /: Search  h: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::ViewTrackData => {
                     "j/k: Move  l: Detail  e: Edit  s: SOTY  a: AOTY  S: Toggle SOTY  A: Toggle AOTY  c: Play  /: Search  h: Back"
@@ -362,13 +362,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "j/k: Move  v: Visual  e: Edit  u: Undo  Ctrl+r: Redo  /: Search  h: Back  q: Menu"
                 }
                 Screen::ViewWriterData => {
-                    "j/k: Move  l: Songs  e: Edit  /: Search  h: Back  q: Menu  Q: Quit"
+                    "j/k: Move  l: Songs  e: Edit  /: Search  h: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::SearchWriterResult { .. } => {
-                    "j/k: Move  l: Detail  e: Edit Writer  c: Play  /: Search  h: Back  q: Menu  Q: Quit"
+                    "j/k: Move  l: Detail  e: Edit Writer  c: Play  /: Search  h: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::SearchTrackResult { .. } => {
-                    "j/k: Move  l: Writer  c: Play  x: Pause  /: Search  h: Back  q: Menu  Q: Quit"
+                    "j/k: Move  l: Writer  c: Play  x: Pause  /: Search  h: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::Quiz => {
                     "i: Insert  Tab: Suggestions  p: Pass  c: Play  h/Esc: Back  q: Menu"

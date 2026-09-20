@@ -87,6 +87,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             stop_spotify(app);
             app.running = false;
         }
+        // アプリ終了 (Ctrl+C。Qと同じ)
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            stop_spotify(app);
+            app.running = false;
+        }
         // メニューに戻る
         KeyCode::Char('q') => {
             if app.screen != Screen::MainMenu {
