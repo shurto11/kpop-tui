@@ -1,8 +1,4 @@
-mod db;
-mod models;
-mod scraper;
-mod spotify;
-mod tui;
+use kpop_tui::{db, models, tui};
 
 use std::io;
 use std::path::PathBuf;

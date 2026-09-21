@@ -817,6 +817,35 @@ pub type AsciiPixel = (char, u8, u8, u8);
 /// ASCIIアート全体（行×列）
 pub type AsciiArt = Vec<Vec<AsciiPixel>>;
 
+/// Spotify oEmbed APIからアルバムアートのサムネイルURLだけを取得（ブラウザ版用）
+pub fn fetch_album_art_url(spotify_url: &str) -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0")
+        // ネットワーク断でHTTPハンドラを止めないよう必ず打ち切る
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?;
+
+    let oembed_url = format!(
+        "https://open.spotify.com/oembed?url={}",
+        urlencoding_manual(spotify_url)
+    );
+
+    let body = client
+        .get(&oembed_url)
+        .send()
+        .context("Failed to fetch oEmbed")?
+        .text()
+        .context("Failed to read oEmbed response")?;
+
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("Failed to parse oEmbed JSON")?;
+
+    json["thumbnail_url"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("No thumbnail_url in oEmbed response"))
+}
+
 /// Spotify oEmbed APIからアルバムアートを取得してカラーASCIIアートに変換
 pub fn fetch_album_art_ascii(spotify_url: &str, width: u32, height: u32) -> Result<AsciiArt> {
     let client = reqwest::blocking::Client::builder()

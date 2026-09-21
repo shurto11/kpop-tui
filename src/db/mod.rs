@@ -18,6 +18,21 @@ impl Database {
         Ok(db)
     }
 
+    /// データベースを読み取り専用で開く（ブラウザ版用）
+    ///
+    /// マイグレーションを一切走らせないので、TUI版が同じファイルを
+    /// 開いたまま起動しても書き込みが競合しない。
+    pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .context("Failed to open database (read-only)")?;
+        // TUI側の書き込みトランザクション中でも即エラーにせず待つ
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     /// スキーマを初期化
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(

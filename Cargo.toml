@@ -3,10 +3,26 @@ name = "kpop-tui"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kpop_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kpop-tui"
+path = "src/main.rs"
+
+[[bin]]
+name = "kpop-web"
+path = "src/bin/web.rs"
+
 [dependencies]
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+
+# Web (ブラウザ版)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
