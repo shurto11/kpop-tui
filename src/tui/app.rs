@@ -177,6 +177,8 @@ pub struct App {
     pub log_undo_stack: Vec<CreditData>,
     // ViewLog: アルバム名インライン編集中
     pub editing_log_album: bool,
+    // InputTrackData: BPM検索用アーティスト名の入力中（edit_bufferを使う）
+    pub editing_bpm_artist: bool,
 
     // AutoAdd状態
     pub auto_add_rows: Vec<AutoAddRow>,
@@ -435,6 +437,7 @@ impl App {
             pending_delete_index: None,
             log_undo_stack: Vec::new(),
             editing_log_album: false,
+            editing_bpm_artist: false,
             auto_add_rows: Vec::new(),
             auto_add_phase: AutoAddPhase::Idle,
             auto_add_next_id: 0,

@@ -297,6 +297,19 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // InputTrackData: BPM検索用アーティスト名の入力欄
+    if app.editing_bpm_artist {
+        let footer = Paragraph::new(format!(">{}", app.edit_buffer))
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("BPM search artist (Enter: Search  Esc: Cancel)"),
+            );
+        frame.render_widget(footer, area);
+        return;
+    }
+
     // メッセージ表示
     if let Some(ref msg) = app.message {
         let footer = Paragraph::new(msg.as_str())
@@ -329,7 +342,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputTrackData => {
-                    "l: Select  a: Next BPM  r: Refetch BPM  i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
+                    "l: Select  a: Next BPM  r/R: Refetch BPM (R: as artist)  i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputWriterAka => {
                     "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q/^C: Quit"

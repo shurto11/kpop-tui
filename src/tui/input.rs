@@ -44,6 +44,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // InputTrackData: BPM検索用アーティスト名の入力
+    if app.editing_bpm_artist {
+        handle_bpm_artist_edit(app, key);
+        return;
+    }
+
     // AutoAdd: Track/Artistのインライン編集
     if app.auto_add_editing.is_some() {
         handle_auto_add_edit(app, key);
@@ -334,7 +340,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 && !app.current_track.is_empty()
             {
                 // 入力中のフォームは残したまま検索し、結果で上書きする
-                start_bpm_search(app);
+                let artist = app.current_artist.clone();
+                start_bpm_search(app, &artist);
             } else if matches!(app.screen, Screen::ViewLog) {
                 if let Some(credit) = app.log_undo_stack.pop() {
                     match app.db.insert_song(&credit) {
@@ -350,6 +357,19 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 } else {
                     app.show_message("Nothing to rewind");
                 }
+            }
+        }
+
+        // TrackData: アーティスト名を指定してBPM再取得。
+        // 改名したグループは旧名義でしか載っていないことがある（i-dle → (G)I-DLE）
+        KeyCode::Char('R') => {
+            if matches!(app.screen, Screen::InputTrackData)
+                && !app.form_fields.is_empty()
+                && !app.current_track.is_empty()
+            {
+                app.edit_buffer = app.current_artist.clone();
+                app.edit_cursor = app.edit_buffer.chars().count();
+                app.editing_bpm_artist = true;
             }
         }
 
@@ -1160,6 +1180,34 @@ fn handle_log_album_edit(app: &mut App, key: KeyEvent) {
             app.edit_buffer.clear();
             app.edit_cursor = 0;
         }
+        _ => edit_buffer_key(app, key),
+    }
+}
+
+/// InputTrackData: BPM検索用アーティスト名の入力
+fn handle_bpm_artist_edit(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            app.editing_bpm_artist = false;
+            let artist = app.edit_buffer.trim().to_string();
+            app.edit_buffer.clear();
+            app.edit_cursor = 0;
+            if !artist.is_empty() {
+                start_bpm_search(app, &artist);
+            }
+        }
+        KeyCode::Esc => {
+            app.editing_bpm_artist = false;
+            app.edit_buffer.clear();
+            app.edit_cursor = 0;
+        }
+        _ => edit_buffer_key(app, key),
+    }
+}
+
+/// edit_buffer への1行入力の共通キー処理
+fn edit_buffer_key(app: &mut App, key: KeyEvent) {
+    match key.code {
         KeyCode::Char(c) => {
             let byte_idx = char_to_byte_index(&app.edit_buffer, app.edit_cursor);
             app.edit_buffer.insert(byte_idx, c);
@@ -1736,7 +1784,8 @@ fn handle_confirm(app: &mut App) {
                     // 曲選択
                     if let Some(track) = app.suggestions.get(app.suggestion_index) {
                         app.current_track = track.clone();
-                        start_bpm_search(app);
+                        let artist = app.current_artist.clone();
+                        start_bpm_search(app, &artist);
                     }
                 }
             }
@@ -2165,9 +2214,10 @@ fn remove_char_at(s: &mut String, char_idx: usize) {
     }
 }
 
-/// バックグラウンドでsongbpm.comの曲検索を開始
-fn start_bpm_search(app: &mut App) {
-    let artist = app.current_artist.clone();
+/// バックグラウンドでsongbpm.comの曲検索を開始。
+/// artist は通常 current_artist だが、R で別名義を指定できる
+fn start_bpm_search(app: &mut App, artist: &str) {
+    let artist = artist.to_string();
     let track = app.current_track.clone();
     let (tx, rx) = mpsc::channel();
     // 前の検索の受信側はここで捨てられ、結果は届かなくなる
