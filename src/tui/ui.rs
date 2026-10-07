@@ -1724,7 +1724,7 @@ fn draw_writer_table(frame: &mut Frame, app: &App, area: Rect) {
 
 /// TrackDataテーブル
 fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Sp", "Rel", "A", "S"])
+    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Rel"])
         .style(Style::default().add_modifier(Modifier::BOLD))
         .height(1);
 
@@ -1771,10 +1771,7 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(genre_display),
                 Cell::from(duration),
                 Cell::from(track.bpm.clone().unwrap_or_default()),
-                Cell::from(if track.spotify.as_ref().map_or(false, |s| !s.is_empty()) { "#".to_string() } else { String::new() }),
                 Cell::from(release.to_string()),
-                Cell::from(if track.is_aoty { "*" } else { "" }.to_string()),
-                Cell::from(if track.is_soty { "*" } else { "" }.to_string()),
             ])
             .style(style)
         })
@@ -1783,18 +1780,15 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(11), // Artist
-            Constraint::Percentage(7),  // Label
+            Constraint::Percentage(14), // Artist
+            Constraint::Percentage(8),  // Label
             Constraint::Percentage(9),  // Date
-            Constraint::Percentage(11), // Album
-            Constraint::Percentage(15), // Track
-            Constraint::Percentage(12), // Genre
-            Constraint::Percentage(5),  // Duration
-            Constraint::Percentage(5),  // BPM
-            Constraint::Percentage(3),  // Spotify
-            Constraint::Percentage(5),  // Release
-            Constraint::Percentage(4),  // AOTY
-            Constraint::Percentage(4),  // SOTY
+            Constraint::Percentage(16), // Album
+            Constraint::Percentage(20), // Track
+            Constraint::Percentage(13), // Genre
+            Constraint::Percentage(6),  // Duration
+            Constraint::Percentage(6),  // BPM
+            Constraint::Percentage(8),  // Release
         ],
     )
     .header(header)
