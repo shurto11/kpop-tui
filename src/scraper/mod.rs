@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use scraper::{Html, Selector};
 
-use crate::models::{BpmArtistInfo, BpmTrackInfo, Config, Credit, ScrapedSongInfo};
+use crate::models::{BpmTrackInfo, Config, Credit, ScrapedSongInfo};
 
 /// GeniusのURL生成
 pub fn make_url(artist: &str, track: &str) -> String {
@@ -563,65 +563,83 @@ fn parse_date(raw: &str) -> Option<String> {
     None
 }
 
-/// songbpm.comのURL生成
-pub fn make_songbpm_url(artist: &str) -> String {
-    let slug = clean_text(artist);
-    format!("https://songbpm.com/@{}", slug)
-}
-
-/// songbpm.comからBPM情報をスクレイピング
-pub fn scrape_songbpm(url: &str) -> Result<BpmArtistInfo> {
+/// songbpm.comの検索で「アーティスト 曲名」のBPM候補を取得。
+/// アーティストページはカーソル式の10件ずつのページングで並列化できず、
+/// 曲数の多いアーティストだと数十秒かかるため、曲単位で検索する。
+pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    let mut all_tracks: Vec<BpmTrackInfo> = Vec::new();
-    let mut current_url = url.to_string();
-    let artist_name = extract_artist_from_url(url);
+    // 検索はあいまいで上位5件しか返らず、"ALL(H)OURS DANG DANG" のように
+    // アーティスト名を含めると目的の曲が落ちることがある。
+    // 曲名のみの検索も並列で投げて結果を合わせる
+    let with_artist = format!("{} {}", artist, track);
+    let (r1, r2) = std::thread::scope(|s| {
+        let h = s.spawn(|| fetch_songbpm_search(&client, &with_artist));
+        let r2 = fetch_songbpm_search(&client, track);
+        (h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("songbpm search panicked"))), r2)
+    });
+    let results: Vec<BpmTrackInfo> = match (r1, r2) {
+        (Err(e), Err(_)) => return Err(e),
+        (a, b) => a.unwrap_or_default().into_iter().chain(b.unwrap_or_default()).collect(),
+    };
 
-    // ページネーションを辿って全トラックを取得
-    loop {
-        let response = client
-            .get(&current_url)
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .send()
-            .context("Failed to fetch songbpm page")?;
-
-        let html = response.text().context("Failed to read songbpm response")?;
-        let (tracks, next_url) = parse_songbpm_html(&html, &artist_name)?;
-        all_tracks.extend(tracks);
-
-        match next_url {
-            Some(next) => {
-                current_url = if next.starts_with("http") {
-                    next
-                } else {
-                    format!("https://songbpm.com{}", next)
-                };
+    // 検索結果には他アーティストの曲も混ざるので絞る
+    let target = normalize_artist_for_bpm(artist);
+    let mut seen = std::collections::HashSet::new();
+    let by_artist: Vec<BpmTrackInfo> = results
+        .into_iter()
+        .filter(|t| {
+            // 正規化で空になる名前（ハングルのみ等）は判定できないので通す
+            if target.is_empty() {
+                return true;
             }
-            None => break,
-        }
-    }
+            let a = normalize_artist_for_bpm(&t.artist);
+            if !a.is_empty() && (a.contains(&target) || target.contains(&a)) {
+                return true;
+            }
+            // グループ名義のソロ曲は曲名側に名前が入る
+            // 例: IVE "Force (ANYUJIN Solo)"
+            normalize_artist_for_bpm(&t.track_name).contains(&target)
+        })
+        // 2つの検索で同じ曲が重複するので除く
+        .filter(|t| seen.insert((t.track_name.clone(), t.bpm.clone(), t.duration.clone())))
+        .collect();
 
-    Ok(BpmArtistInfo {
-        artist: artist_name,
-        tracks: all_tracks,
-    })
+    Ok(find_all_tracks_in_bpm_data(&by_artist, track)
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
-/// URLからアーティスト名を抽出
-fn extract_artist_from_url(url: &str) -> String {
-    url.split("/@")
-        .nth(1)
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .to_string()
+/// songbpm.comに検索クエリを投げて結果カードをパース
+fn fetch_songbpm_search(client: &reqwest::blocking::Client, query: &str) -> Result<Vec<BpmTrackInfo>> {
+    // SvelteKitのCSRFチェックがあり、Originがないと403になる。
+    // 成功すると302で /searches/<id> の結果ページへ飛ぶ
+    let html = client
+        .post("https://songbpm.com/searches")
+        .header("Origin", "https://songbpm.com")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .form(&[("query", query)])
+        .send()
+        .context("Failed to search songbpm")?
+        .error_for_status()
+        .context("songbpm search failed")?
+        .text()
+        .context("Failed to read songbpm response")?;
+
+    parse_songbpm_html(&html)
+}
+
+/// アーティスト名の照合用正規化（"(G)I-DLE" と "i-dle" を近づけるため空白も除去）
+fn normalize_artist_for_bpm(name: &str) -> String {
+    normalize_track_name(name).replace(' ', "")
 }
 
 /// songbpm.comのHTMLをパースしてトラック情報を抽出
-fn parse_songbpm_html(html: &str, _artist: &str) -> Result<(Vec<BpmTrackInfo>, Option<String>)> {
+fn parse_songbpm_html(html: &str) -> Result<Vec<BpmTrackInfo>> {
     let document = Html::parse_document(html);
 
     // トラックカードのコンテナ: div.bg-card
@@ -639,17 +657,16 @@ fn parse_songbpm_html(html: &str, _artist: &str) -> Result<(Vec<BpmTrackInfo>, O
     let spotify_selector = Selector::parse("a[href*='open.spotify.com']")
         .map_err(|e| anyhow::anyhow!("Invalid spotify selector: {:?}", e))?;
 
-    // 次ページリンク
-    let next_selector = Selector::parse("a[href*='after=']")
-        .map_err(|e| anyhow::anyhow!("Invalid next selector: {:?}", e))?;
-
     let mut tracks: Vec<BpmTrackInfo> = Vec::new();
 
     for card in document.select(&card_selector) {
-        // トラック名を取得（2番目のpタグ = 曲名）
+        // 1番目のpタグ = アーティスト名、2番目 = 曲名
         let ps: Vec<_> = card.select(&p_selector).collect();
-        let track_name = if ps.len() >= 2 {
-            ps[1].text().collect::<String>().trim().to_string()
+        let (artist, track_name) = if ps.len() >= 2 {
+            (
+                ps[0].text().collect::<String>().trim().to_string(),
+                ps[1].text().collect::<String>().trim().to_string(),
+            )
         } else {
             continue;
         };
@@ -692,6 +709,7 @@ fn parse_songbpm_html(html: &str, _artist: &str) -> Result<(Vec<BpmTrackInfo>, O
             .map(|s| s.to_string());
 
         tracks.push(BpmTrackInfo {
+            artist,
             track_name,
             duration,
             bpm,
@@ -699,14 +717,7 @@ fn parse_songbpm_html(html: &str, _artist: &str) -> Result<(Vec<BpmTrackInfo>, O
         });
     }
 
-    // 次ページURLを取得
-    let next_url = document
-        .select(&next_selector)
-        .next()
-        .and_then(|el| el.value().attr("href"))
-        .map(|s| s.to_string());
-
-    Ok((tracks, next_url))
+    Ok(tracks)
 }
 
 /// アーティスト名を正規化（括弧内韓国語の除去・残存韓国語文字の除去）

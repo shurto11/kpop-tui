@@ -152,7 +152,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     app.loading = false;
-                    app.show_error("BPM scraping thread disconnected");
+                    app.show_error("BPM search thread disconnected");
                 }
             }
         }

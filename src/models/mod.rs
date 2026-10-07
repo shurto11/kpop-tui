@@ -193,17 +193,11 @@ impl Role {
 /// songbpm.comからのトラック情報
 #[derive(Debug, Clone)]
 pub struct BpmTrackInfo {
+    pub artist: String,
     pub track_name: String,
     pub duration: Option<String>,
     pub bpm: Option<String>,
     pub spotify_url: Option<String>,
-}
-
-/// songbpm.comからのアーティスト情報
-#[derive(Debug, Clone)]
-pub struct BpmArtistInfo {
-    pub artist: String,
-    pub tracks: Vec<BpmTrackInfo>,
 }
 
 /// 設定ファイル

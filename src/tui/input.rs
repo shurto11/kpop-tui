@@ -2,8 +2,8 @@ use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::models::{ArtistData, BpmArtistInfo, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
-use crate::scraper::{find_all_tracks_in_bpm_data, make_songbpm_url, make_url, scrape_genius, scrape_songbpm};
+use crate::models::{ArtistData, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
+use crate::scraper::{make_url, scrape_genius, search_songbpm};
 use crate::tui::app::{App, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter};
 
 /// キー入力を処理
@@ -1725,13 +1725,7 @@ fn handle_confirm(app: &mut App) {
                     // 曲選択
                     if let Some(track) = app.suggestions.get(app.suggestion_index) {
                         app.current_track = track.clone();
-
-                        // キャッシュがあれば即マッチ処理、なければスクレイプ開始
-                        if app.bpm_cache.is_some() && app.bpm_cache_artist == app.current_artist {
-                            handle_bpm_matches(app);
-                        } else {
-                            start_bpm_scrape(app);
-                        }
+                        start_bpm_search(app);
                     }
                 }
             }
@@ -2160,25 +2154,18 @@ fn remove_char_at(s: &mut String, char_idx: usize) {
     }
 }
 
-/// バックグラウンドでsongbpm.comスクレイプを開始
-fn start_bpm_scrape(app: &mut App) {
+/// バックグラウンドでsongbpm.comの曲検索を開始
+fn start_bpm_search(app: &mut App) {
     let artist = app.current_artist.clone();
-
-    // 同じアーティストのキャッシュがあればスキップ
-    if app.bpm_cache_artist == artist && app.bpm_cache.is_some() {
-        return;
-    }
-
-    let url = make_songbpm_url(&artist);
+    let track = app.current_track.clone();
     let (tx, rx) = mpsc::channel();
+    // 前の検索の受信側はここで捨てられ、結果は届かなくなる
     app.bpm_receiver = Some(rx);
-    app.bpm_cache_artist = artist.clone();
-    app.bpm_cache = None;
     app.loading = true;
-    app.loading_message = format!("Fetching BPM: {}", artist);
+    app.loading_message = format!("Fetching BPM: {} - {}", artist, track);
 
     std::thread::spawn(move || {
-        let result = scrape_songbpm(&url);
+        let result = search_songbpm(&artist, &track);
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
 }
@@ -2229,17 +2216,8 @@ fn setup_track_form(app: &mut App, dur: &str, bpm: Option<String>, spotify: &str
     app.suggestions.clear();
 }
 
-/// BPMキャッシュからマッチを検索し、1件なら即フォーム、複数なら選択UIを表示
-fn handle_bpm_matches(app: &mut App) {
-    let mut matches: Vec<BpmTrackInfo> = if let Some(ref cache) = app.bpm_cache {
-        find_all_tracks_in_bpm_data(&cache.tracks, &app.current_track)
-            .into_iter()
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
+/// BPMマッチをフォームに反映。1件なら即フォーム、複数なら選択UIを表示
+fn handle_bpm_matches(app: &mut App, mut matches: Vec<BpmTrackInfo>) {
     // 重複除去（track_name, bpm, duration が同じものを除く）
     matches.dedup_by(|a, b| {
         a.track_name == b.track_name && a.bpm == b.bpm && a.duration == b.duration
@@ -2281,22 +2259,19 @@ fn fill_form_from_bpm_match(app: &mut App) {
     }
 }
 
-/// BPMスクレイピング結果を処理
-pub fn process_bpm_result(app: &mut App, result: Result<BpmArtistInfo, String>) {
+/// BPM検索結果を処理
+pub fn process_bpm_result(app: &mut App, result: Result<Vec<BpmTrackInfo>, String>) {
     match result {
-        Ok(info) => {
-            app.bpm_cache = Some(info);
-
-            // スクレイプ完了 → マッチ処理
+        Ok(matches) => {
             if matches!(app.screen, Screen::InputTrackData)
                 && app.form_fields.is_empty()
                 && !app.current_track.is_empty()
             {
-                handle_bpm_matches(app);
+                handle_bpm_matches(app, matches);
             }
         }
         Err(_) => {
-            // スクレイプ失敗 → 空フォームを表示して手入力可
+            // 検索失敗 → 空フォームを表示して手入力可
             if matches!(app.screen, Screen::InputTrackData)
                 && app.form_fields.is_empty()
                 && !app.current_track.is_empty()

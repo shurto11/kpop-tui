@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use crate::db::Database;
-use crate::models::{ArtistData, BpmArtistInfo, BpmTrackInfo, Config, ScrapedSongInfo, TrackData, CreditData, WriterData};
+use crate::models::{ArtistData, BpmTrackInfo, Config, ScrapedSongInfo, TrackData, CreditData, WriterData};
 
 /// 操作モード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,10 +141,8 @@ pub struct App {
     pub scrape_receiver: Option<mpsc::Receiver<Result<ScrapedSongInfo, String>>>,
     pub tick: usize,
 
-    // songbpm.comバックグラウンドスクレイピング
-    pub bpm_receiver: Option<mpsc::Receiver<Result<BpmArtistInfo, String>>>,
-    pub bpm_cache: Option<BpmArtistInfo>,
-    pub bpm_cache_artist: String,
+    // songbpm.comバックグラウンド検索
+    pub bpm_receiver: Option<mpsc::Receiver<Result<Vec<BpmTrackInfo>, String>>>,
     pub bpm_matches: Vec<BpmTrackInfo>,
     pub bpm_pending_matches: Vec<BpmTrackInfo>,
 
@@ -420,8 +418,6 @@ impl App {
             scrape_receiver: None,
             tick: 0,
             bpm_receiver: None,
-            bpm_cache: None,
-            bpm_cache_artist: String::new(),
             bpm_matches: Vec::new(),
             bpm_pending_matches: Vec::new(),
             spotify_playing: false,
@@ -566,11 +562,9 @@ impl App {
     }
 
     pub fn go_to(&mut self, screen: Screen) {
-        // InputTrackData以外に遷移する場合はBPMキャッシュをクリア
+        // InputTrackData以外に遷移する場合はBPM検索を破棄
         if !matches!(screen, Screen::InputTrackData) {
             self.bpm_receiver = None;
-            self.bpm_cache = None;
-            self.bpm_cache_artist.clear();
         }
         // InputAutoAdd以外に遷移する場合はAutoAdd状態クリア＋ワーカー中断。
         // ただしAutoAddから未登録アーティストの登録に行く場合は、戻ってきて続きをやるので残す
@@ -617,11 +611,9 @@ impl App {
     /// 前の画面に戻る
     pub fn go_back(&mut self) {
         if let Some((prev, saved_list_index, saved_list_offset, saved_menu_index)) = self.screen_stack.pop() {
-            // InputTrackData以外に戻る場合はBPMキャッシュをクリア
+            // InputTrackData以外に戻る場合はBPM検索を破棄
             if !matches!(prev, Screen::InputTrackData) {
                 self.bpm_receiver = None;
-                self.bpm_cache = None;
-                self.bpm_cache_artist.clear();
             }
             // InputAutoAdd以外に戻る場合はAutoAdd状態クリア＋ワーカー中断
             if !matches!(prev, Screen::InputAutoAdd) {
