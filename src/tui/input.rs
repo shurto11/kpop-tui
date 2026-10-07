@@ -325,10 +325,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             }
         }
 
-        // ViewLog: リワインド（削除を元に戻す）/ AutoAdd: 再チェック
+        // ViewLog: リワインド（削除を元に戻す）/ AutoAdd: 再チェック / TrackData: BPM再取得
         KeyCode::Char('r') => {
             if matches!(app.screen, Screen::InputAutoAdd) {
                 handle_auto_add_recheck(app);
+            } else if matches!(app.screen, Screen::InputTrackData)
+                && !app.form_fields.is_empty()
+                && !app.current_track.is_empty()
+            {
+                // 入力中のフォームは残したまま検索し、結果で上書きする
+                start_bpm_search(app);
             } else if matches!(app.screen, Screen::ViewLog) {
                 if let Some(credit) = app.log_undo_stack.pop() {
                     match app.db.insert_song(&credit) {
@@ -455,6 +461,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 // SOTY/AOTY を保持
                 app.edit_is_soty = t.is_soty;
                 app.edit_is_aoty = t.is_aoty;
+                // 前の曲のBPM候補が残っていると a で別の曲に切り替わってしまう
+                app.bpm_matches.clear();
+                app.bpm_pending_matches.clear();
+                app.suggestion_index = 0;
+                app.form_header = t.track.clone();
                 let dur = t.duration.map(|d| d.to_string()).unwrap_or_default();
                 let spotify = t.spotify.unwrap_or_default();
                 let release_idx = if t.is_title { 1 } else if t.is_prerelease { 2 } else { 0 };
@@ -2193,6 +2204,10 @@ fn setup_track_form(app: &mut App, dur: &str, bpm: Option<String>, spotify: &str
         FormField::new("BPM")
     };
 
+    // フォーム表示中（候補の切り替え・再取得）なら入力済みのRelease/Genreを残す
+    let kept_release = app.form_fields.get(3).cloned();
+    let kept_genre = app.form_fields.get(4).cloned();
+
     // 既存のgenresを取得
     let existing_genres = app.db.get_song_add(&app.current_artist, &app.current_track)
         .ok()
@@ -2208,8 +2223,8 @@ fn setup_track_form(app: &mut App, dur: &str, bpm: Option<String>, spotify: &str
         FormField::with_value("Duration (sec)", dur),
         bpm_field,
         FormField::with_value("Spotify URL", spotify),
-        FormField::select("Release", vec!["-", "Title", "Pre"], 0),
-        FormField::with_value("Genre", &existing_genres),
+        kept_release.unwrap_or_else(|| FormField::select("Release", vec!["-", "Title", "Pre"], 0)),
+        kept_genre.unwrap_or_else(|| FormField::with_value("Genre", &existing_genres)),
     ];
     app.form_index = 0;
     app.mode = Mode::Normal;
@@ -2225,6 +2240,12 @@ fn handle_bpm_matches(app: &mut App, mut matches: Vec<BpmTrackInfo>) {
             && a.duration == b.duration
             && a.spotify_url == b.spotify_url
     });
+
+    // 再取得で見つからなければ、入力済みの値を消さない
+    if matches.is_empty() && !app.form_fields.is_empty() {
+        app.show_message(&format!("No BPM found: {} - {}", app.current_artist, app.current_track));
+        return;
+    }
 
     if matches.is_empty() {
         app.bpm_matches = Vec::new();
@@ -2266,20 +2287,21 @@ fn fill_form_from_bpm_match(app: &mut App) {
 pub fn process_bpm_result(app: &mut App, result: Result<Vec<BpmTrackInfo>, String>) {
     match result {
         Ok(matches) => {
-            if matches!(app.screen, Screen::InputTrackData)
-                && app.form_fields.is_empty()
-                && !app.current_track.is_empty()
-            {
+            // フォーム表示中に届くのは r による再取得の結果
+            if matches!(app.screen, Screen::InputTrackData) && !app.current_track.is_empty() {
                 handle_bpm_matches(app, matches);
             }
         }
-        Err(_) => {
-            // 検索失敗 → 空フォームを表示して手入力可
-            if matches!(app.screen, Screen::InputTrackData)
-                && app.form_fields.is_empty()
-                && !app.current_track.is_empty()
-            {
+        Err(e) => {
+            if !matches!(app.screen, Screen::InputTrackData) || app.current_track.is_empty() {
+                return;
+            }
+            if app.form_fields.is_empty() {
+                // 検索失敗 → 空フォームを表示して手入力可
                 setup_track_form(app, "", None, "", "");
+            } else {
+                // 再取得の失敗 → 入力済みの値は残す
+                app.show_error(&format!("BPM fetch failed: {}", e));
             }
         }
     }

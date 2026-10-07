@@ -329,7 +329,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputTrackData => {
-                    "l: Select  a: Next BPM  i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
+                    "l: Select  a: Next BPM  r: Refetch BPM  i: Insert  h/Esc: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::InputWriterAka => {
                     "j/k: Move  Space: Toggle  h/Esc: Back  q: Menu  Q/^C: Quit"
