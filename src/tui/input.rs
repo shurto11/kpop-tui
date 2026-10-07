@@ -2218,9 +2218,12 @@ fn setup_track_form(app: &mut App, dur: &str, bpm: Option<String>, spotify: &str
 
 /// BPMマッチをフォームに反映。1件なら即フォーム、複数なら選択UIを表示
 fn handle_bpm_matches(app: &mut App, mut matches: Vec<BpmTrackInfo>) {
-    // 重複除去（track_name, bpm, duration が同じものを除く）
+    // 重複除去（track_name, bpm, duration, spotify_url が同じものを除く）
     matches.dedup_by(|a, b| {
-        a.track_name == b.track_name && a.bpm == b.bpm && a.duration == b.duration
+        a.track_name == b.track_name
+            && a.bpm == b.bpm
+            && a.duration == b.duration
+            && a.spotify_url == b.spotify_url
     });
 
     if matches.is_empty() {

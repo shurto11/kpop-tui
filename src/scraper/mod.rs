@@ -694,8 +694,16 @@ fn search_songbpm_queries(
             // 例: IVE "Force (ANYUJIN Solo)"
             normalize_artist_for_bpm(&t.track_name).contains(&target)
         })
-        // 複数の検索で同じ曲が重複するので除く
-        .filter(|t| seen.insert((t.track_name.clone(), t.bpm.clone(), t.duration.clone())))
+        // 複数の検索で同じ曲が重複するので除く。
+        // Spotify IDが違えば別の版（コンピレーション等）なので残す
+        .filter(|t| {
+            seen.insert((
+                t.track_name.clone(),
+                t.bpm.clone(),
+                t.duration.clone(),
+                t.spotify_url.clone(),
+            ))
+        })
         .collect();
 
     Ok(find_all_tracks_in_bpm_data(&by_artist, track)
