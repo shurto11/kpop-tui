@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::models::{ArtistData, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
 use crate::scraper::{make_url, scrape_genius, search_songbpm};
-use crate::tui::app::{App, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter};
+use crate::tui::app::{App, AutoAddBpmStatus, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS};
 
 /// キー入力を処理
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -54,6 +54,19 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
     if app.auto_add_editing.is_some() {
         handle_auto_add_edit(app, key);
         return;
+    }
+
+    // AutoAdd: Tabで一覧とTrackData枠を行き来する
+    if matches!(app.screen, Screen::InputAutoAdd) {
+        if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+            if !app.auto_add_rows.is_empty() {
+                app.auto_add_detail_focus = !app.auto_add_detail_focus;
+            }
+            return;
+        }
+        if app.auto_add_detail_focus && handle_auto_add_detail_key(app, key) {
+            return;
+        }
     }
 
     // ViewLog: 削除確認待ち (y/n)
@@ -269,8 +282,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             {
                 app.suggestion_index = (app.suggestion_index + 1) % app.bpm_matches.len();
                 fill_form_from_bpm_match(app);
+            } else if matches!(app.screen, Screen::InputAutoAdd) {
+                handle_auto_add_next_bpm_match(app);
             }
         }
+
 
         // s: SOTYフィルタ (ViewTrackData)
         KeyCode::Char('s') => {
@@ -363,7 +379,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // TrackData: アーティスト名を指定してBPM再取得。
         // 改名したグループは旧名義でしか載っていないことがある（i-dle → (G)I-DLE）
         KeyCode::Char('R') => {
-            if matches!(app.screen, Screen::InputTrackData)
+            if matches!(app.screen, Screen::InputAutoAdd) {
+                handle_auto_add_refetch_bpm(app);
+            } else if matches!(app.screen, Screen::InputTrackData)
                 && !app.form_fields.is_empty()
                 && !app.current_track.is_empty()
             {
@@ -2122,6 +2140,9 @@ fn handle_open_spotify(app: &mut App) {
         } else {
             None
         }
+    } else if matches!(app.screen, Screen::InputAutoAdd) {
+        // AutoAdd: カーソル行のお気に入りのURL（BPMを聴いて確かめる用）
+        app.auto_add_rows.get(app.list_index).and_then(|r| r.spotify_url.clone())
     } else if matches!(app.screen, Screen::ViewTrackData) {
         // View画面: カーソル位置のトラックからSpotify URLを取得
         app.tracks.get(app.list_index)
@@ -2675,6 +2696,7 @@ pub fn process_auto_add_msg(app: &mut App, msg: AutoAddMsg) {
             app.auto_add_phase = AutoAddPhase::Ready;
             app.show_error(&e);
         }
+        AutoAddMsg::Bpm { id, result } => apply_bpm_result(app, id, result),
     }
 }
 
@@ -2739,12 +2761,89 @@ fn build_auto_add_rows(app: &mut App, liked: Vec<crate::spotify::LikedTrack>) {
             failed_track: None,
             failed_artist: None,
             failed_url: None,
+            spotify_url: l.url.clone(),
+            duration_sec: l.duration_ms.map(|ms| (ms + 500) / 1000),
+            // 追加済みの曲はTrackDataも入れないのでBPMも取らない
+            bpm_status: if dup {
+                AutoAddBpmStatus::NotFound
+            } else {
+                AutoAddBpmStatus::Pending
+            },
+            // songbpmはSpotifyのデータなのでSpotify名で引く
+            bpm_query_artist: l.artists.first().cloned().unwrap_or_default(),
+            bpm_query_track: l.name.clone(),
+            bpm_matches: Vec::new(),
+            bpm_match_index: 0,
+            bpm_exact: false,
+            bpm_choice: 0,
+            release: 0,
         });
     }
 
     app.list_index = 0;
     app.list_offset = 0;
     start_pending_checks(app);
+    start_pending_bpm(app);
+}
+
+/// BPM未取得の行をまとめて取得にかける。
+/// ワーカーは1本だけなので、取得中の行も含めて投げ直す
+fn start_pending_bpm(app: &mut App) {
+    let mut targets = Vec::new();
+    for row in app.auto_add_rows.iter_mut() {
+        if row.status == AutoAddStatus::Duplicate
+            || !matches!(row.bpm_status, AutoAddBpmStatus::Pending | AutoAddBpmStatus::Fetching)
+        {
+            continue;
+        }
+        row.bpm_status = AutoAddBpmStatus::Fetching;
+        targets.push((
+            row.id,
+            row.bpm_query_artist.clone(),
+            row.bpm_query_track.clone(),
+            row.spotify_url.clone(),
+        ));
+    }
+    app.start_auto_add_bpm(targets);
+}
+
+/// BPM取得結果を行に反映する
+fn apply_bpm_result(
+    app: &mut App,
+    id: u64,
+    result: Result<(Vec<BpmTrackInfo>, bool), String>,
+) {
+    let Some(row) = app.auto_add_rows.iter_mut().find(|r| r.id == id) else {
+        return;
+    };
+    match result {
+        Ok((matches, exact)) => {
+            row.bpm_status = if matches.is_empty() {
+                AutoAddBpmStatus::NotFound
+            } else {
+                AutoAddBpmStatus::Found
+            };
+            row.bpm_matches = matches;
+            row.bpm_exact = exact;
+        }
+        Err(_) => {
+            row.bpm_status = AutoAddBpmStatus::Error;
+            row.bpm_matches.clear();
+            row.bpm_exact = false;
+        }
+    }
+    row.bpm_match_index = 0;
+    row.bpm_choice = row.default_bpm_choice();
+}
+
+/// BPMワーカーが終了した（txがdropされた）ときの後処理
+pub fn finish_auto_add_bpm(app: &mut App) {
+    // 届かなかった行はPendingに戻しておく（r / R で再試行できる）
+    for row in app.auto_add_rows.iter_mut() {
+        if row.bpm_status == AutoAddBpmStatus::Fetching {
+            row.bpm_status = AutoAddBpmStatus::Pending;
+        }
+    }
 }
 
 /// Pending状態の行をまとめてチェックにかける
@@ -2868,7 +2967,7 @@ fn auto_add_running(app: &App) -> bool {
     matches!(
         app.auto_add_phase,
         AutoAddPhase::Fetching | AutoAddPhase::Checking
-    )
+    ) || app.auto_add_bpm_rx.is_some()
 }
 
 /// AutoAdd: 走っているワーカーを止める
@@ -2876,6 +2975,10 @@ fn cancel_auto_add(app: &mut App) {
     app.auto_add_cancel
         .store(true, std::sync::atomic::Ordering::Relaxed);
     app.auto_add_rx = None;
+    app.auto_add_bpm_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.auto_add_bpm_rx = None;
+    finish_auto_add_bpm(app);
     for row in app.auto_add_rows.iter_mut() {
         if row.status == AutoAddStatus::Checking {
             row.status = AutoAddStatus::Pending;
@@ -3025,8 +3128,100 @@ fn handle_auto_add_recheck(app: &mut App) {
         row.info = None;
         row.genius_url = None;
         row.resolved_artist = None;
+        // 取れているBPMは選択ごと残し、取れなかった行だけ取り直す
+        if matches!(row.bpm_status, AutoAddBpmStatus::NotFound | AutoAddBpmStatus::Error) {
+            row.bpm_status = AutoAddBpmStatus::Pending;
+        }
     }
     start_pending_checks(app);
+    start_pending_bpm(app);
+}
+
+/// AutoAdd: 次のBPM候補へ（InputTrackDataの a と同じ）
+fn handle_auto_add_next_bpm_match(app: &mut App) {
+    let Some(row) = app.auto_add_rows.get_mut(app.list_index) else {
+        return;
+    };
+    if row.bpm_matches.len() < 2 {
+        return;
+    }
+    row.bpm_match_index = (row.bpm_match_index + 1) % row.bpm_matches.len();
+    row.bpm_choice = row.default_bpm_choice();
+}
+
+/// AutoAdd: TrackData枠にフォーカス中のキー処理。
+/// Inputのフォームと同じく j/k でフィールド移動、h/l で選択肢を切り替える。
+/// 処理したら true。false のキー（Enter・c・R・q など）は通常の処理に回す
+fn handle_auto_add_detail_key(app: &mut App, key: KeyEvent) -> bool {
+    let n_fields = AUTO_ADD_DETAIL_FIELDS.len();
+    match key.code {
+        KeyCode::Esc => app.auto_add_detail_focus = false,
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.auto_add_detail_index + 1 < n_fields {
+                app.auto_add_detail_index += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.auto_add_detail_index = app.auto_add_detail_index.saturating_sub(1);
+        }
+        KeyCode::Char('h') | KeyCode::Left => move_auto_add_detail_choice(app, false),
+        KeyCode::Char('l') | KeyCode::Right => move_auto_add_detail_choice(app, true),
+        // 一覧の操作（行の削除・編集など）は枠の中では効かせない
+        KeyCode::Char('d') | KeyCode::Char('e') | KeyCode::Char('o') | KeyCode::Char('r') => {}
+        _ => return false,
+    }
+    true
+}
+
+/// AutoAdd: TrackData枠の選択中フィールドの選択肢を左右に動かす（端で止める）
+fn move_auto_add_detail_choice(app: &mut App, forward: bool) {
+    let field = AUTO_ADD_DETAIL_FIELDS[app.auto_add_detail_index];
+    let Some(row) = app.auto_add_rows.get_mut(app.list_index) else {
+        return;
+    };
+    if row.status == AutoAddStatus::Duplicate {
+        return;
+    }
+    let step = |cur: usize, len: usize| -> usize {
+        if forward {
+            (cur + 1).min(len.saturating_sub(1))
+        } else {
+            cur.saturating_sub(1)
+        }
+    };
+    match field {
+        "Candidate" => {
+            let next = step(row.bpm_match_index, row.bpm_matches.len());
+            if next != row.bpm_match_index {
+                row.bpm_match_index = next;
+                row.bpm_choice = row.default_bpm_choice();
+            }
+        }
+        "BPM" => row.bpm_choice = step(row.bpm_choice, row.bpm_options().len()),
+        "Release" => row.release = step(row.release, RELEASE_OPTIONS.len()),
+        _ => {}
+    }
+}
+
+/// AutoAdd: カーソル行のBPMを、行の今の名前（Genius名・編集後の名前）で取り直す。
+/// Spotify名で見つからない曲向け
+fn handle_auto_add_refetch_bpm(app: &mut App) {
+    let Some(row) = app.auto_add_rows.get_mut(app.list_index) else {
+        return;
+    };
+    if row.status == AutoAddStatus::Duplicate {
+        return;
+    }
+    row.bpm_query_artist = row.resolved_artist.clone().unwrap_or_else(|| row.artist.clone());
+    row.bpm_query_track = row.track.clone();
+    row.bpm_status = AutoAddBpmStatus::Pending;
+    row.bpm_matches.clear();
+    row.bpm_match_index = 0;
+    row.bpm_exact = false;
+    row.bpm_choice = 0;
+    let msg = format!("Refetching BPM: {} - {}", row.bpm_query_artist, row.bpm_query_track);
+    start_pending_bpm(app);
+    app.show_message(&msg);
 }
 
 /// AutoAdd: カーソル行のGeniusページをブラウザで開く
@@ -3093,6 +3288,20 @@ fn handle_auto_add_commit(app: &mut App) {
         return;
     }
 
+    let bpm_waiting = app
+        .auto_add_rows
+        .iter()
+        .filter(|r| r.status != AutoAddStatus::Duplicate)
+        .filter(|r| matches!(r.bpm_status, AutoAddBpmStatus::Pending | AutoAddBpmStatus::Fetching))
+        .count();
+    if bpm_waiting > 0 {
+        app.show_error(&format!(
+            "BPM not fetched yet ({} left) - wait, or r to retry",
+            bpm_waiting
+        ));
+        return;
+    }
+
     // ✓ と dup 以外が残っていたら追加しない
     let not_ready = app
         .auto_add_rows
@@ -3111,6 +3320,8 @@ fn handle_auto_add_commit(app: &mut App) {
     // お気に入りは新しい順で並んでいるので逆順に回す。
     let mut credits: Vec<CreditData> = Vec::new();
     let mut names: Vec<String> = Vec::new();
+    let mut tracks: Vec<TrackData> = Vec::new();
+    let mut no_bpm = 0usize;
     let mut songs = 0usize;
 
     for row in app.auto_add_rows.iter().rev() {
@@ -3142,6 +3353,33 @@ fn handle_auto_add_commit(app: &mut App) {
                 names.push(credit.name.clone());
             }
         }
+
+        // BPMが空の曲はTrackDataを作らない。作るとInputTrackDataの候補から消えて後で埋めにくい
+        let Some(bpm) = row.bpm_value() else {
+            no_bpm += 1;
+            continue;
+        };
+        tracks.push(TrackData {
+            id: None,
+            // credit_dataと同じ名前で入れる（InputTrackData等はこの組で突き合わせる）
+            track: info.track.clone(),
+            artist: artist.clone(),
+            label: None,
+            date: None,
+            album: None,
+            duration: row.duration_sec.or_else(|| {
+                row.bpm_match()
+                    .and_then(|m| m.duration.as_deref())
+                    .and_then(parse_duration)
+            }),
+            bpm: Some(bpm),
+            spotify: row.spotify_url.clone(),
+            is_title: RELEASE_OPTIONS[row.release] == "Title",
+            is_prerelease: RELEASE_OPTIONS[row.release] == "Pre",
+            is_aoty: false,
+            is_soty: false,
+            genres: None,
+        });
     }
 
     if credits.is_empty() {
@@ -3161,7 +3399,32 @@ fn handle_auto_add_commit(app: &mut App) {
         let _ = app.db.update_writer_count(name);
     }
 
+    // 既にTrackDataがある曲は上書きしない（upsertだとgenresやAOTY/SOTYが消える）
+    let mut track_added = 0usize;
+    let mut track_failed = 0usize;
+    for t in &tracks {
+        if app.db.get_song_add(&t.artist, &t.track).ok().flatten().is_some() {
+            continue;
+        }
+        match app.db.upsert_song_add(t) {
+            Ok(_) => track_added += 1,
+            Err(_) => track_failed += 1,
+        }
+    }
+
     app.auto_add_rows.clear();
+    app.auto_add_detail_focus = false;
     app.auto_add_phase = AutoAddPhase::Empty;
-    app.show_message(&format!("Added {} songs ({} credits)", songs, total));
+    let mut msg = format!(
+        "Added {} songs ({} credits, {} TrackData)",
+        songs, total, track_added
+    );
+    if no_bpm > 0 {
+        msg.push_str(&format!(" - {} without BPM: fill in InputTrackData", no_bpm));
+    }
+    if track_failed > 0 {
+        app.show_error(&format!("{} - {} TrackData failed to save", msg, track_failed));
+    } else {
+        app.show_message(&msg);
+    }
 }

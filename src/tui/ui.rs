@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use chrono::{Datelike, Local, NaiveDate};
-use crate::tui::app::{App, AutoAddPhase, AutoAddRow, AutoAddStatus, Mode, Screen};
+use crate::tui::app::{App, AutoAddBpmStatus, AutoAddPhase, AutoAddRow, AutoAddStatus, Mode, Screen, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS};
 
 /// AOTY/SOTY用の金色
 const GOLD: Color = Color::Rgb(255, 215, 0);
@@ -350,11 +350,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Screen::InputAutoAdd => {
                     if app.auto_add_editing.is_some() {
                         "Enter: Save  Tab: Next Field  Esc: Cancel  ←→: Cursor  BS: Delete"
+                    } else if app.auto_add_detail_focus {
+                        "j/k: Field  h/l: Select  Tab/Esc: List  R: Refetch BPM  c: Play  Enter: Add All"
                     } else {
                         match app.auto_add_phase {
                             AutoAddPhase::Fetching => "Esc: Cancel",
-                            AutoAddPhase::Checking => "Esc: Cancel scan",
-                            _ => "j/k: Move  e: Edit  d: Delete  r: Recheck  o: Open  Enter: Add All  h/Esc: Back",
+                            AutoAddPhase::Checking => "j/k: Move  Tab: TrackData  c: Play  Esc: Cancel scan",
+                            _ => "j/k: Move  Tab: TrackData  e: Edit  d: Delete  r: Recheck  R: Refetch BPM  o: Open  c: Play  Enter: Add All",
                         }
                     }
                 }
@@ -918,7 +920,7 @@ fn draw_writer_aka(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// AutoAdd: Spotifyお気に入りからの追加候補一覧
-fn draw_auto_add(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_auto_add(frame: &mut Frame, app: &mut App, area: Rect) {
     let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let spin = spinner[app.tick % spinner.len()];
 
@@ -937,6 +939,22 @@ fn draw_auto_add(frame: &mut Frame, app: &App, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title("AutoAdd"));
         frame.render_widget(empty, area);
         return;
+    }
+
+    // 下にカーソル行のTrackData（BPM・Release）の選択欄を出す
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(6)])
+        .split(area);
+    let (area, detail_area) = (chunks[0], chunks[1]);
+
+    // 一覧の高さが選択欄の分だけ減るので、表示行数とスクロール位置を合わせ直す
+    app.visible_rows = (area.height as usize).saturating_sub(2).max(1);
+    if app.list_index >= app.list_offset + app.visible_rows {
+        app.list_offset = app.list_index + 1 - app.visible_rows;
+    }
+    if app.list_index < app.list_offset {
+        app.list_offset = app.list_index;
     }
 
     let end = (app.list_offset + app.visible_rows).min(app.auto_add_rows.len());
@@ -992,6 +1010,8 @@ fn draw_auto_add(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::raw(truncate_str(&row.artist, 24)));
             }
 
+            spans.extend(bpm_release_spans(row, spin));
+
             // 追加日は YYYY-MM-DD だけ見せる
             let date = row.added_at.split('T').next().unwrap_or("").to_string();
             if !date.is_empty() {
@@ -1040,8 +1060,188 @@ fn draw_auto_add(frame: &mut Frame, app: &App, area: Rect) {
         ),
     };
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    // フォーカスしている枠の枠線を目立たせる
+    let list_border = if app.auto_add_detail_focus {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(list_border),
+    );
     frame.render_widget(list, area);
+
+    if let Some(row) = app.auto_add_rows.get(app.list_index) {
+        let selected = app.auto_add_detail_focus.then_some(app.auto_add_detail_index);
+        draw_auto_add_detail(frame, row, spin, selected, detail_area);
+    }
+}
+
+/// AutoAdd: 一覧の行に付けるBPMとReleaseの短い表示
+fn bpm_release_spans(row: &AutoAddRow, spin: char) -> Vec<Span<'static>> {
+    if row.status == AutoAddStatus::Duplicate {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let (text, color) = match row.bpm_status {
+        AutoAddBpmStatus::Pending => ("  BPM -".to_string(), Color::DarkGray),
+        AutoAddBpmStatus::Fetching => (format!("  BPM {}", spin), Color::Yellow),
+        AutoAddBpmStatus::NotFound => ("  no BPM".to_string(), Color::Red),
+        AutoAddBpmStatus::Error => ("  BPM!".to_string(), Color::Red),
+        AutoAddBpmStatus::Found => {
+            let bpm = match row.bpm_value() {
+                Some(b) if b.parse::<i64>().is_ok() => format!("{} BPM", b),
+                Some(b) => b,
+                None => "BPM -".to_string(),
+            };
+            // Spotify IDで一致した候補を選んでいれば確定、それ以外は要確認
+            if row.bpm_exact && row.bpm_match_index == 0 {
+                (format!("  {}", bpm), Color::Green)
+            } else {
+                (format!("  {}?", bpm), Color::Yellow)
+            }
+        }
+    };
+    spans.push(Span::styled(text, Style::default().fg(color)));
+    let release = RELEASE_OPTIONS[row.release];
+    if release != "-" {
+        spans.push(Span::styled(
+            format!("  [{}]", release),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans
+}
+
+/// 横並びの選択肢（選択中を [ ] で囲む。TrackDataフォームの選択欄と同じ見た目）
+fn select_spans(options: &[String], selected: usize) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, opt) in options.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        if i == selected {
+            spans.push(Span::styled(
+                format!("[{}]", opt),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!(" {} ", opt),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    spans
+}
+
+/// AutoAdd: カーソル行のTrackData（BPM候補・BPM・Release）の選択欄
+/// selected: フォーカス中なら選択中フィールドの添字
+fn draw_auto_add_detail(
+    frame: &mut Frame,
+    row: &AutoAddRow,
+    spin: char,
+    selected: Option<usize>,
+    area: Rect,
+) {
+    // 選択中のフィールドはInputのフォームと同じく "> " を付ける
+    let label = |s: &str| {
+        let idx = AUTO_ADD_DETAIL_FIELDS.iter().position(|f| *f == s);
+        if idx.is_some() && idx == selected {
+            Span::styled(
+                format!("{:<16}", format!("> {}", s)),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!("{:<16}", s), Style::default().fg(Color::Cyan))
+        }
+    };
+    let mut lines: Vec<Line> = Vec::new();
+
+    if row.status == AutoAddStatus::Duplicate {
+        lines.push(Line::from(Span::styled(
+            "Already in CreditData - TrackData is not added",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // 候補
+        let mut cand = vec![label("Candidate")];
+        match row.bpm_status {
+            AutoAddBpmStatus::Pending => cand.push(Span::styled(
+                "not fetched (r: retry)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            AutoAddBpmStatus::Fetching => cand.push(Span::styled(
+                format!("{} searching songbpm: {} - {}", spin, row.bpm_query_artist, row.bpm_query_track),
+                Style::default().fg(Color::Yellow),
+            )),
+            AutoAddBpmStatus::NotFound => cand.push(Span::styled(
+                format!("not found: {} - {} (R: search by this row's names)", row.bpm_query_artist, row.bpm_query_track),
+                Style::default().fg(Color::Red),
+            )),
+            AutoAddBpmStatus::Error => cand.push(Span::styled(
+                "fetch failed (r: retry)",
+                Style::default().fg(Color::Red),
+            )),
+            AutoAddBpmStatus::Found => {
+                if let Some(m) = row.bpm_match() {
+                    cand.push(Span::raw(format!(
+                        "{}/{}  {} — {}",
+                        row.bpm_match_index + 1,
+                        row.bpm_matches.len(),
+                        m.track_name,
+                        m.artist
+                    )));
+                    if let Some(d) = &m.duration {
+                        cand.push(Span::styled(format!("  {}", d), Style::default().fg(Color::DarkGray)));
+                    }
+                    if row.bpm_exact && row.bpm_match_index == 0 {
+                        cand.push(Span::styled("  ✓ Spotify match", Style::default().fg(Color::Green)));
+                    } else {
+                        cand.push(Span::styled("  ? not the liked version", Style::default().fg(Color::Yellow)));
+                    }
+                }
+            }
+        }
+        lines.push(Line::from(cand));
+
+        let mut bpm = vec![label("BPM")];
+        bpm.extend(select_spans(&row.bpm_options(), row.bpm_choice));
+        lines.push(Line::from(bpm));
+
+        let release: Vec<String> = RELEASE_OPTIONS.iter().map(|s| s.to_string()).collect();
+        let mut rel = vec![label("Release")];
+        rel.extend(select_spans(&release, row.release));
+        lines.push(Line::from(rel));
+
+        let dur = row
+            .duration_sec
+            .map(|d| format!("{}:{:02}", d / 60, d % 60))
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(Line::from(vec![
+            label("Duration"),
+            Span::raw(dur),
+            Span::styled(
+                format!("   {}", row.spotify_url.as_deref().unwrap_or("no Spotify URL")),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    let detail = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("TrackData: {} — {}", row.track, row.artist))
+            .border_style(if selected.is_some() {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }),
+    );
+    frame.render_widget(detail, area);
 }
 
 /// ✗ だったときの値を1行で表す。編集で直した場合も自動で直った場合も残す。

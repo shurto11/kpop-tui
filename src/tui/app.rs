@@ -189,9 +189,16 @@ pub struct App {
     pub auto_add_cancel: Arc<AtomicBool>,
     /// インライン編集中のフィールド: 0=Track, 1=Artist
     pub auto_add_editing: Option<usize>,
+    /// Tabで下のTrackData枠にフォーカスしているか
+    pub auto_add_detail_focus: bool,
+    /// TrackData枠の選択中フィールド（AUTO_ADD_DETAIL_FIELDSの添字）
+    pub auto_add_detail_index: usize,
     /// チェック済み件数 / 全体（進捗表示用）
     pub auto_add_done: usize,
     pub auto_add_total: usize,
+    /// BPM取得ワーカー（Geniusチェックとは別サイトなので並行して走らせる）
+    pub auto_add_bpm_rx: Option<mpsc::Receiver<AutoAddMsg>>,
+    pub auto_add_bpm_cancel: Arc<AtomicBool>,
 
     // Quiz状態
     pub quiz_questions: Vec<(String, String, String)>, // (artist, track, spotify_url)
@@ -249,6 +256,77 @@ pub struct AutoAddRow {
     pub failed_track: Option<String>,
     pub failed_artist: Option<String>,
     pub failed_url: Option<String>,
+
+    // TrackData用
+    /// お気に入りのSpotify URL（TrackDataのspotifyに入れる。BPM候補の照合にも使う）
+    pub spotify_url: Option<String>,
+    /// Spotify APIの曲の長さ（秒）
+    pub duration_sec: Option<i64>,
+    pub bpm_status: AutoAddBpmStatus,
+    /// songbpmの検索に使う名前。最初はSpotify名、Rで行の現在の名前に差し替える
+    pub bpm_query_artist: String,
+    pub bpm_query_track: String,
+    pub bpm_matches: Vec<BpmTrackInfo>,
+    /// 選択中の候補
+    pub bpm_match_index: usize,
+    /// 先頭候補がお気に入りとSpotify IDで一致したか
+    pub bpm_exact: bool,
+    /// bpm_options()のうち選択中のもの
+    pub bpm_choice: usize,
+    /// RELEASE_OPTIONSのうち選択中のもの
+    pub release: usize,
+}
+
+/// AutoAddのTrackData枠で選べるフィールド
+pub const AUTO_ADD_DETAIL_FIELDS: [&str; 3] = ["Candidate", "BPM", "Release"];
+
+/// TrackDataのReleaseの選択肢（InputTrackDataと同じ）
+pub const RELEASE_OPTIONS: [&str; 3] = ["-", "Title", "Pre"];
+
+impl AutoAddRow {
+    /// 選択中の候補
+    pub fn bpm_match(&self) -> Option<&BpmTrackInfo> {
+        self.bpm_matches.get(self.bpm_match_index)
+    }
+
+    /// BPMの選択肢。InputTrackDataと同じく半分・そのまま・倍・MIXX。
+    /// 候補がなければ "-"（空欄）とMIXXだけ
+    pub fn bpm_options(&self) -> Vec<String> {
+        match self.bpm_match().and_then(|m| m.bpm.clone()) {
+            Some(b) => match b.parse::<i64>() {
+                Ok(n) => vec![(n / 2).to_string(), b, (n * 2).to_string(), "MIXX".to_string()],
+                Err(_) => vec![b, "MIXX".to_string()],
+            },
+            None => vec!["-".to_string(), "MIXX".to_string()],
+        }
+    }
+
+    /// 候補を切り替えたときの初期選択（数値ならそのままの値）
+    pub fn default_bpm_choice(&self) -> usize {
+        let numeric = self
+            .bpm_match()
+            .and_then(|m| m.bpm.as_ref())
+            .is_some_and(|b| b.parse::<i64>().is_ok());
+        if numeric { 1 } else { 0 }
+    }
+
+    /// DBに入れるBPM。"-" は未入力
+    pub fn bpm_value(&self) -> Option<String> {
+        self.bpm_options()
+            .get(self.bpm_choice)
+            .filter(|b| b.as_str() != "-")
+            .cloned()
+    }
+}
+
+/// AutoAdd: 各行のBPM取得状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoAddBpmStatus {
+    Pending,
+    Fetching,
+    Found,
+    NotFound,
+    Error,
 }
 
 /// AutoAdd: 画面の進行状態
@@ -274,6 +352,11 @@ pub enum AutoAddMsg {
     },
     /// スキャン全体の中断
     Aborted(String),
+    /// 1行のBPM取得完了。(候補, 先頭がSpotify IDで一致したか)
+    Bpm {
+        id: u64,
+        result: Result<(Vec<BpmTrackInfo>, bool), String>,
+    },
 }
 
 /// TrackDataフィルタ
@@ -444,8 +527,12 @@ impl App {
             auto_add_rx: None,
             auto_add_cancel: Arc::new(AtomicBool::new(false)),
             auto_add_editing: None,
+            auto_add_detail_focus: false,
+            auto_add_detail_index: 0,
             auto_add_done: 0,
             auto_add_total: 0,
+            auto_add_bpm_rx: None,
+            auto_add_bpm_cancel: Arc::new(AtomicBool::new(false)),
             quiz_questions: Vec::new(),
             quiz_current: 0,
             quiz_score: 0,
@@ -528,14 +615,48 @@ impl App {
         });
     }
 
+    /// 指定した行のBPM取得をバックグラウンドで開始する。
+    /// 前のワーカーは止めるので、取得中の行も呼び出し側でtargetsに含めること。
+    /// targets: (id, artist, track, spotify_url)
+    pub fn start_auto_add_bpm(&mut self, targets: Vec<(u64, String, String, Option<String>)>) {
+        self.auto_add_bpm_cancel.store(true, Ordering::Relaxed);
+        if targets.is_empty() {
+            self.auto_add_bpm_rx = None;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.auto_add_bpm_cancel = Arc::clone(&cancel);
+        self.auto_add_bpm_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            for (id, artist, track, spotify_url) in targets {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result =
+                    crate::scraper::search_songbpm_for_spotify(&artist, &track, spotify_url.as_deref())
+                        .map_err(|e| e.to_string());
+                if tx.send(AutoAddMsg::Bpm { id, result }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     /// AutoAdd画面から離れるときの後始末。
     /// ワーカーは receiver を落としただけでは止まらないので、必ずキャンセルフラグを立てる。
     fn clear_auto_add(&mut self) {
         self.auto_add_cancel.store(true, Ordering::Relaxed);
         self.auto_add_rx = None;
+        self.auto_add_bpm_cancel.store(true, Ordering::Relaxed);
+        self.auto_add_bpm_rx = None;
         self.auto_add_rows.clear();
         self.auto_add_phase = AutoAddPhase::Idle;
         self.auto_add_editing = None;
+        self.auto_add_detail_focus = false;
+        self.auto_add_detail_index = 0;
         self.auto_add_done = 0;
         self.auto_add_total = 0;
     }
@@ -1160,4 +1281,68 @@ fn extract_name_words(name: &str) -> Vec<String> {
         .filter(|s| !IGNORE_WORDS.contains(&s.to_lowercase().as_str()))
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod auto_add_row_tests {
+    use super::*;
+
+    fn row_with_bpm(bpm: Option<&str>) -> AutoAddRow {
+        AutoAddRow {
+            id: 0,
+            seq: 0,
+            track: "t".into(),
+            artist: "a".into(),
+            artists_all: vec![],
+            added_at: String::new(),
+            status: AutoAddStatus::Ok,
+            resolved_artist: None,
+            info: None,
+            genius_url: None,
+            spotify_album: None,
+            spotify_date: None,
+            failed_track: None,
+            failed_artist: None,
+            failed_url: None,
+            spotify_url: None,
+            duration_sec: None,
+            bpm_status: AutoAddBpmStatus::Found,
+            bpm_query_artist: String::new(),
+            bpm_query_track: String::new(),
+            bpm_matches: bpm
+                .map(|b| {
+                    vec![BpmTrackInfo {
+                        artist: "a".into(),
+                        track_name: "t".into(),
+                        duration: None,
+                        bpm: Some(b.into()),
+                        spotify_url: None,
+                    }]
+                })
+                .unwrap_or_default(),
+            bpm_match_index: 0,
+            bpm_exact: false,
+            bpm_choice: 0,
+            release: 0,
+        }
+    }
+
+    #[test]
+    fn numeric_bpm_defaults_to_as_is() {
+        let mut r = row_with_bpm(Some("180"));
+        assert_eq!(r.bpm_options(), vec!["90", "180", "360", "MIXX"]);
+        r.bpm_choice = r.default_bpm_choice();
+        assert_eq!(r.bpm_value().as_deref(), Some("180"));
+        r.bpm_choice = 0;
+        assert_eq!(r.bpm_value().as_deref(), Some("90"));
+    }
+
+    #[test]
+    fn no_bpm_is_empty_unless_mixx() {
+        let mut r = row_with_bpm(None);
+        r.bpm_choice = r.default_bpm_choice();
+        assert_eq!(r.bpm_value(), None);
+        r.bpm_choice = 1;
+        assert_eq!(r.bpm_value().as_deref(), Some("MIXX"));
+    }
 }

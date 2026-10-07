@@ -567,11 +567,57 @@ fn parse_date(raw: &str) -> Option<String> {
 /// アーティストページを先頭から辿ると10件ずつのページングで
 /// 曲数の多いアーティストだと数十秒かかるため、曲単位で引く。
 pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = songbpm_client()?;
+    let found = collect_songbpm_candidates(&client, artist, track)?;
+    Ok(sort_by_release_date(&client, found))
+}
+
+/// AutoAdd用。songbpmはSpotify URLでは検索できないので名前で引き、
+/// お気に入りの曲とSpotify IDが一致する候補があれば先頭に置く。
+/// 戻り値の bool は一致したかどうか。一致しなければ通常どおりリリース日順
+pub fn search_songbpm_for_spotify(
+    artist: &str,
+    track: &str,
+    spotify_url: Option<&str>,
+) -> Result<(Vec<BpmTrackInfo>, bool)> {
+    let client = songbpm_client()?;
+    let mut found = collect_songbpm_candidates(&client, artist, track)?;
+
+    let target = spotify_url.and_then(spotify_track_id);
+    let exact = target.and_then(|id| {
+        found
+            .iter()
+            .position(|t| t.spotify_url.as_deref().and_then(spotify_track_id) == Some(id))
+    });
+    match exact {
+        // 一致すればそれで確定なので、リリース日の取得（候補数ぶんのリクエスト）は省く
+        Some(idx) => {
+            let hit = found.remove(idx);
+            found.insert(0, hit);
+            Ok((found, true))
+        }
+        None => Ok((sort_by_release_date(&client, found), false)),
+    }
+}
+
+/// SpotifyのトラックURLからIDを取り出す
+pub fn spotify_track_id(url: &str) -> Option<&str> {
+    url.split("/track/").nth(1)?.split(['?', '/']).next().filter(|id| !id.is_empty())
+}
+
+fn songbpm_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
         .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+        .build()?)
+}
 
+/// songbpm.comからBPM候補を集める（並べ替え前）
+fn collect_songbpm_candidates(
+    client: &reqwest::blocking::Client,
+    artist: &str,
+    track: &str,
+) -> Result<Vec<BpmTrackInfo>> {
     // アーティストページは曲名順に並び、?after=<曲名slug> で目的の曲の位置へ直接飛べる。
     // ただしslugの付け方が一定でなく（"fromis9" / "g-i-dle"）、同じアーティストが
     // 複数slugに分かれていることもある（"all-h-ours" と "allhours"）ので両方引く。
@@ -593,9 +639,9 @@ pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
     }
     requests.push(SongbpmRequest::Search(format!("{} {}", artist, track)));
     requests.push(SongbpmRequest::Search(track.to_string()));
-    let found = search_songbpm_queries(&client, &requests, artist, track)?;
+    let found = search_songbpm_queries(client, &requests, artist, track)?;
     if !found.is_empty() {
-        return Ok(sort_by_release_date(&client, found));
+        return Ok(found);
     }
 
     // それでも落ちる曲がある（"ENHYPEN Bloody Paradise" は外れ、
@@ -614,8 +660,7 @@ pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
         .take(4)
         .map(|w| SongbpmRequest::Search(format!("{} {}", artist, w)))
         .collect();
-    let found = search_songbpm_queries(&client, &requests, artist, track)?;
-    Ok(sort_by_release_date(&client, found))
+    search_songbpm_queries(client, &requests, artist, track)
 }
 
 /// 候補をSpotifyのリリース日の古い順に並べる。
@@ -655,7 +700,7 @@ fn sort_by_release_date(
 
 /// Spotifyの埋め込みページ（認証不要）からトラックのリリース日を取得
 fn fetch_spotify_release_date(client: &reqwest::blocking::Client, track_url: &str) -> Option<String> {
-    let id = track_url.split("/track/").nth(1)?.split(['?', '/']).next()?;
+    let id = spotify_track_id(track_url)?;
     let html = client
         .get(format!("https://open.spotify.com/embed/track/{}", id))
         .send()
@@ -1191,6 +1236,43 @@ mod autoadd_tests {
                 GeniusCheck::NotFound { tried } => println!("MISS {} / {} tried={:?}", a, t, tried),
                 GeniusCheck::NetworkError(e) => println!("NET  {} / {} {}", a, t, e),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod songbpm_spotify_tests {
+    use super::*;
+
+    #[test]
+    fn track_id_from_url() {
+        assert_eq!(
+            spotify_track_id("https://open.spotify.com/track/0a4MMyCrzT0En247IhqZbD"),
+            Some("0a4MMyCrzT0En247IhqZbD")
+        );
+        assert_eq!(
+            spotify_track_id("https://open.spotify.com/track/0a4MMyCrzT0En247IhqZbD?si=abc"),
+            Some("0a4MMyCrzT0En247IhqZbD")
+        );
+        assert_eq!(spotify_track_id("https://open.spotify.com/album/xyz"), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_search_for_spotify() {
+        for (a, t, url) in [
+            ("NewJeans", "Hype Boy", "https://open.spotify.com/track/0a4MMyCrzT0En247IhqZbD"),
+            ("KiiiKiii", "I DO ME", "https://open.spotify.com/track/4u1F4TxSFHWw8JnhXwMXsh"),
+            ("NMIXX", "DASH", "https://open.spotify.com/track/1mXIJLlpAEG3Vab5b21QIM"),
+        ] {
+            let (found, exact) = search_songbpm_for_spotify(a, t, Some(url)).expect("search");
+            println!(
+                "{} / {} exact={} first={:?}",
+                a,
+                t,
+                exact,
+                found.first().map(|f| (&f.track_name, &f.bpm, &f.spotify_url))
+            );
         }
     }
 }

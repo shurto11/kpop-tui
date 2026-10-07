@@ -23,6 +23,8 @@ pub struct LikedTrack {
     pub album: Option<String>,
     /// "2026-09-14" または "2026" のような部分日付
     pub release_date: Option<String>,
+    /// 曲の長さ（ミリ秒）
+    pub duration_ms: Option<i64>,
 }
 
 const API_BASE: &str = "https://api.spotify.com/v1/me/tracks";
@@ -144,6 +146,7 @@ fn parse_item(item: &serde_json::Value) -> Option<LikedTrack> {
         release_date: track["album"]["release_date"]
             .as_str()
             .map(|s| s.to_string()),
+        duration_ms: track["duration_ms"].as_i64(),
     })
 }
 
