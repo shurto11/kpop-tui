@@ -595,7 +595,7 @@ pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
     requests.push(SongbpmRequest::Search(track.to_string()));
     let found = search_songbpm_queries(&client, &requests, artist, track)?;
     if !found.is_empty() {
-        return Ok(found);
+        return Ok(sort_by_release_date(&client, found));
     }
 
     // それでも落ちる曲がある（"ENHYPEN Bloody Paradise" は外れ、
@@ -614,7 +614,63 @@ pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
         .take(4)
         .map(|w| SongbpmRequest::Search(format!("{} {}", artist, w)))
         .collect();
-    search_songbpm_queries(&client, &requests, artist, track)
+    let found = search_songbpm_queries(&client, &requests, artist, track)?;
+    Ok(sort_by_release_date(&client, found))
+}
+
+/// 候補をSpotifyのリリース日の古い順に並べる。
+/// 同じ曲がコンピレーション等で別IDとして複数登録されているので、
+/// 最も古いもの（オリジナル）を先頭にする。日付が取れないものは末尾
+fn sort_by_release_date(
+    client: &reqwest::blocking::Client,
+    tracks: Vec<BpmTrackInfo>,
+) -> Vec<BpmTrackInfo> {
+    if tracks.len() < 2 {
+        return tracks;
+    }
+    let dates: Vec<Option<String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = tracks
+            .iter()
+            .map(|t| {
+                s.spawn(move || {
+                    t.spotify_url
+                        .as_deref()
+                        .and_then(|url| fetch_spotify_release_date(client, url))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+    });
+
+    let mut paired: Vec<(Option<String>, BpmTrackInfo)> = dates.into_iter().zip(tracks).collect();
+    // ISO 8601なので文字列比較で日付順になる。同日は元の順を保つ
+    paired.sort_by(|(a, _), (b, _)| match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    paired.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Spotifyの埋め込みページ（認証不要）からトラックのリリース日を取得
+fn fetch_spotify_release_date(client: &reqwest::blocking::Client, track_url: &str) -> Option<String> {
+    let id = track_url.split("/track/").nth(1)?.split(['?', '/']).next()?;
+    let html = client
+        .get(format!("https://open.spotify.com/embed/track/{}", id))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    let doc = Html::parse_document(&html);
+    let selector = Selector::parse("script#__NEXT_DATA__").ok()?;
+    let json_text = doc.select(&selector).next()?.text().collect::<String>();
+    let json: serde_json::Value = serde_json::from_str(&json_text).ok()?;
+    json["props"]["pageProps"]["state"]["data"]["entity"]["releaseDate"]["isoString"]
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// songbpm.comへの1リクエスト
