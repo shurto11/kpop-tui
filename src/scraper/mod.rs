@@ -563,28 +563,118 @@ fn parse_date(raw: &str) -> Option<String> {
     None
 }
 
-/// songbpm.comの検索で「アーティスト 曲名」のBPM候補を取得。
-/// アーティストページはカーソル式の10件ずつのページングで並列化できず、
-/// 曲数の多いアーティストだと数十秒かかるため、曲単位で検索する。
+/// songbpm.comから「アーティスト 曲名」のBPM候補を取得。
+/// アーティストページを先頭から辿ると10件ずつのページングで
+/// 曲数の多いアーティストだと数十秒かかるため、曲単位で引く。
 pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    // 検索はあいまいで上位5件しか返らず、"ALL(H)OURS DANG DANG" のように
-    // アーティスト名を含めると目的の曲が落ちることがある。
-    // 曲名のみの検索も並列で投げて結果を合わせる
-    let with_artist = format!("{} {}", artist, track);
-    let (r1, r2) = std::thread::scope(|s| {
-        let h = s.spawn(|| fetch_songbpm_search(&client, &with_artist));
-        let r2 = fetch_songbpm_search(&client, track);
-        (h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("songbpm search panicked"))), r2)
+    // アーティストページは曲名順に並び、?after=<曲名slug> で目的の曲の位置へ直接飛べる。
+    // ただしslugの付け方が一定でなく（"fromis9" / "g-i-dle"）、同じアーティストが
+    // 複数slugに分かれていることもある（"all-h-ours" と "allhours"）ので両方引く。
+    // 検索もあいまいで上位5件しか返らず、"ALL(H)OURS DANG DANG" のように
+    // アーティスト名を含めると目的の曲が落ちることがあるので、曲名のみの検索も合わせる
+    let mut requests: Vec<SongbpmRequest> = Vec::new();
+    let track_slug = songbpm_slug(track);
+    if !track_slug.is_empty() {
+        let compact = songbpm_slug(artist).replace('-', "");
+        for artist_slug in [songbpm_slug(artist), compact] {
+            if artist_slug.is_empty() {
+                continue;
+            }
+            let url = format!("https://songbpm.com/@{}?after={}", artist_slug, track_slug);
+            if !requests.iter().any(|r| matches!(r, SongbpmRequest::ArtistPage(u) if *u == url)) {
+                requests.push(SongbpmRequest::ArtistPage(url));
+            }
+        }
+    }
+    requests.push(SongbpmRequest::Search(format!("{} {}", artist, track)));
+    requests.push(SongbpmRequest::Search(track.to_string()));
+    let found = search_songbpm_queries(&client, &requests, artist, track)?;
+    if !found.is_empty() {
+        return Ok(found);
+    }
+
+    // それでも落ちる曲がある（"ENHYPEN Bloody Paradise" は外れ、
+    // "ENHYPEN Paradise" なら当たる）ので、アーティスト＋曲名の単語1つずつで再検索
+    let mut words: Vec<String> = Vec::new();
+    for w in normalize_track_name(track).split_whitespace() {
+        if w.len() >= 2 && !words.iter().any(|x| x == w) {
+            words.push(w.to_string());
+        }
+    }
+    if words.len() < 2 {
+        return Ok(found);
+    }
+    let requests: Vec<SongbpmRequest> = words
+        .iter()
+        .take(4)
+        .map(|w| SongbpmRequest::Search(format!("{} {}", artist, w)))
+        .collect();
+    search_songbpm_queries(&client, &requests, artist, track)
+}
+
+/// songbpm.comへの1リクエスト
+enum SongbpmRequest {
+    /// 検索クエリ
+    Search(String),
+    /// アーティストページのURL
+    ArtistPage(String),
+}
+
+/// songbpm.comのslug（小文字、英数字以外は "-" 区切り）
+fn songbpm_slug(text: &str) -> String {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// 複数リクエストを並列で投げ、アーティスト・曲名で絞った結果を返す。
+/// 全リクエストが失敗した場合のみエラー
+fn search_songbpm_queries(
+    client: &reqwest::blocking::Client,
+    requests: &[SongbpmRequest],
+    artist: &str,
+    track: &str,
+) -> Result<Vec<BpmTrackInfo>> {
+    let responses: Vec<Result<Vec<BpmTrackInfo>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = requests
+            .iter()
+            .map(|r| {
+                s.spawn(move || match r {
+                    SongbpmRequest::Search(q) => fetch_songbpm_search(client, q),
+                    SongbpmRequest::ArtistPage(url) => fetch_songbpm_page(client, url),
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("songbpm search panicked"))))
+            .collect()
     });
-    let results: Vec<BpmTrackInfo> = match (r1, r2) {
-        (Err(e), Err(_)) => return Err(e),
-        (a, b) => a.unwrap_or_default().into_iter().chain(b.unwrap_or_default()).collect(),
-    };
+
+    let mut results: Vec<BpmTrackInfo> = Vec::new();
+    let mut last_err = None;
+    let mut any_ok = false;
+    for r in responses {
+        match r {
+            Ok(v) => {
+                any_ok = true;
+                results.extend(v);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if !any_ok {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
 
     // 検索結果には他アーティストの曲も混ざるので絞る
     let target = normalize_artist_for_bpm(artist);
@@ -604,7 +694,7 @@ pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
             // 例: IVE "Force (ANYUJIN Solo)"
             normalize_artist_for_bpm(&t.track_name).contains(&target)
         })
-        // 2つの検索で同じ曲が重複するので除く
+        // 複数の検索で同じ曲が重複するので除く
         .filter(|t| seen.insert((t.track_name.clone(), t.bpm.clone(), t.duration.clone())))
         .collect();
 
@@ -612,6 +702,22 @@ pub fn search_songbpm(artist: &str, track: &str) -> Result<Vec<BpmTrackInfo>> {
         .into_iter()
         .cloned()
         .collect())
+}
+
+/// songbpm.comのアーティストページを1ページ取得して結果カードをパース。
+/// slugが存在しなければ404でエラーになる
+fn fetch_songbpm_page(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<BpmTrackInfo>> {
+    let html = client
+        .get(url)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .context("Failed to fetch songbpm page")?
+        .error_for_status()
+        .context("songbpm page not found")?
+        .text()
+        .context("Failed to read songbpm response")?;
+
+    parse_songbpm_html(&html)
 }
 
 /// songbpm.comに検索クエリを投げて結果カードをパース
