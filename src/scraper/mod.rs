@@ -48,7 +48,7 @@ fn clean_text(text: &str) -> String {
 }
 
 /// Genius用のHTTPクライアント。タイムアウトなしだとハングした1本がワーカーを永久に止める
-fn genius_client() -> Result<reqwest::blocking::Client> {
+pub fn genius_client() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
         .timeout(Duration::from_secs(10))
@@ -83,7 +83,9 @@ pub fn scrape_genius(url: &str, config: &Config) -> Result<ScrapedSongInfo> {
         anyhow::bail!("HTTP {} from Genius", status);
     }
 
-    parse_genius_html(&html, config)
+    let mut info = parse_genius_html(&html, config)?;
+    attach_genius_ids(&client, &html, &mut info);
+    Ok(info)
 }
 
 /// Geniusページ存在確認の結果
@@ -250,7 +252,7 @@ pub fn check_genius_candidates(
             std::thread::sleep(Duration::from_secs(5));
             match genius_get(&client, url) {
                 Ok((s2, h2)) if s2.is_success() => {
-                    return finish_found(url, &h2, config, &tried);
+                    return finish_found(&client, url, &h2, config, &tried);
                 }
                 Ok((s2, _)) => {
                     return GeniusCheck::NetworkError(format!("HTTP {} from Genius", s2));
@@ -264,21 +266,30 @@ pub fn check_genius_candidates(
             return GeniusCheck::NetworkError(format!("HTTP {} from Genius", status));
         }
 
-        return finish_found(url, &html, config, &tried);
+        return finish_found(&client, url, &html, config, &tried);
     }
 
     GeniusCheck::NotFound { tried }
 }
 
 /// 2xxが返ったページをパースして GeniusCheck に詰める
-fn finish_found(url: &str, html: &str, config: &Config, tried: &[String]) -> GeniusCheck {
+fn finish_found(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    html: &str,
+    config: &Config,
+    tried: &[String],
+) -> GeniusCheck {
     match parse_genius_html(html, config) {
-        Ok(info) => GeniusCheck::Found {
-            url: url.to_string(),
-            info: Box::new(info),
-            // 第1候補が外れていたら、その外れたURLを残す
-            failed_url: tried.first().cloned(),
-        },
+        Ok(mut info) => {
+            attach_genius_ids(client, html, &mut info);
+            GeniusCheck::Found {
+                url: url.to_string(),
+                info: Box::new(info),
+                // 第1候補が外れていたら、その外れたURLを残す
+                failed_url: tried.first().cloned(),
+            }
+        }
         Err(_) => {
             // 2xxだがパースできない＝実質見つからなかった扱い
             let mut all = tried.to_vec();
@@ -404,6 +415,7 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
                             credits.push(Credit {
                                 role: normalized.to_string(),
                                 name,
+                                genius_id: None,
                             });
                         }
                     }
@@ -445,6 +457,7 @@ fn parse_genius_html(html: &str, config: &Config) -> Result<ScrapedSongInfo> {
                             credits.push(Credit {
                                 role: normalized.to_string(),
                                 name,
+                                genius_id: None,
                             });
                         }
                     }
@@ -561,6 +574,256 @@ fn parse_date(raw: &str) -> Option<String> {
     }
 
     None
+}
+
+// ========== Genius artist ID ==========
+//
+// クレジット名は Genius 側の改名で変わる（"Haewon (NMIXX)" → "HAEWON (해원)"）が、artist ID は変わらない。
+// 同じ ID の名前どうしを WriterAka に自動で紐付けるため、取り込み時に ID も取っておく。
+// クレジット欄のリンクは名前入りの URL だけで ID を持たないので、サイト内 API（genius.com/api/...、トークン不要）から引く。
+
+/// 曲にクレジットされている Genius アーティスト
+#[derive(Debug, Clone)]
+pub struct GeniusArtist {
+    pub id: u64,
+    pub name: String,
+    /// 作詞・作曲・編曲・Writer のどれかでクレジットされているか。
+    /// エンジニアやレーベルまで別名照合の対象にすると API を無駄に叩くので、絞り込みに使う
+    pub is_writer: bool,
+}
+
+/// Genius のクレジット欄の見出し（"Composers" など）を DB の役割名にする
+fn role_from_label(label: &str) -> Option<&'static str> {
+    let label = label.trim().to_lowercase();
+    let role = if label.ends_with('s') && label != "lyrics" {
+        label.trim_end_matches('s')
+    } else {
+        &label
+    };
+    normalize_role(role)
+}
+
+/// 曲ページの HTML から song ID を取り出す
+pub fn extract_song_id(html: &str) -> Option<u64> {
+    // 基本は <meta content="genius://songs/123">。ページの組み方が変わったとき用に埋め込み JSON も見る
+    let patterns = [
+        r"genius://songs/(\d+)",
+        r#"\\?"value\\?":\\?"Song\\?",\\?"key\\?":\\?"Annotatable Type\\?"\},\{\\?"value\\?":(\d+)"#,
+    ];
+    patterns
+        .iter()
+        .find_map(|p| Regex::new(p).ok()?.captures(html)?.get(1)?.as_str().parse().ok())
+}
+
+/// Genius のサイト内 API を叩いて "response" の中身を返す
+fn genius_api(client: &reqwest::blocking::Client, url: &str) -> Result<serde_json::Value> {
+    let (status, body) = genius_get(client, url)?;
+    if !status.is_success() {
+        anyhow::bail!("HTTP {} from {}", status, url);
+    }
+    let mut v: serde_json::Value =
+        serde_json::from_str(&body).context("Invalid JSON from Genius API")?;
+    Ok(v["response"].take())
+}
+
+/// 曲にクレジットされているアーティスト（作家・プロデューサー・その他の役割すべて）を ID 付きで取得
+pub fn fetch_song_artists(client: &reqwest::blocking::Client, song_id: u64) -> Result<Vec<GeniusArtist>> {
+    let resp = genius_api(client, &format!("https://genius.com/api/songs/{}", song_id))?;
+    let song = &resp["song"];
+    if song.is_null() {
+        anyhow::bail!("Song {} not found in Genius API", song_id);
+    }
+
+    let mut out: Vec<GeniusArtist> = Vec::new();
+    let mut push = |a: &serde_json::Value, is_writer: bool| {
+        let (Some(id), Some(name)) = (a["id"].as_u64(), a["name"].as_str()) else {
+            return;
+        };
+        if let Some(e) = out.iter_mut().find(|e| e.id == id) {
+            e.is_writer |= is_writer;
+        } else {
+            out.push(GeniusArtist { id, name: name.to_string(), is_writer });
+        }
+    };
+
+    for a in song["writer_artists"].as_array().into_iter().flatten() {
+        push(a, true);
+    }
+    for a in song["producer_artists"].as_array().into_iter().flatten() {
+        push(a, false);
+    }
+    // 作詞・作曲・編曲などの個別の役割はこちらに入る
+    for cp in song["custom_performances"].as_array().into_iter().flatten() {
+        let is_writer = role_from_label(cp["label"].as_str().unwrap_or("")).is_some();
+        for a in cp["artists"].as_array().into_iter().flatten() {
+            push(a, is_writer);
+        }
+    }
+    Ok(out)
+}
+
+/// 名前照合用のキー。大文字小文字・空白・記号・ゼロ幅文字の違いを無視する
+pub fn name_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 括弧の外と各括弧の中を別々にキー化して並べ替えたもの。
+/// "KIGGEN (키겐)" と "키겐 (Kiggen)" のように並び順だけが違う表記を同じとみなすために使う
+fn name_parts_key(name: &str) -> Vec<String> {
+    let mut keys: Vec<String> = name
+        .split(['(', ')'])
+        .map(name_key)
+        .filter(|k| !k.is_empty())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// 2つのクレジット名が表記揺れの範囲で同じか（大文字小文字・空白・記号・括弧の並び順の違い）
+pub fn same_credit_name(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (ka, kb) = (name_key(a), name_key(b));
+    if ka.is_empty() || kb.is_empty() {
+        return false;
+    }
+    ka == kb || name_parts_key(a) == name_parts_key(b)
+}
+
+/// クレジット名に当たるアーティストを探す（完全一致を優先し、なければ表記揺れを許す）
+pub fn match_artist<'a>(name: &str, artists: &'a [GeniusArtist]) -> Option<&'a GeniusArtist> {
+    artists
+        .iter()
+        .find(|a| a.name == name)
+        .or_else(|| artists.iter().find(|a| same_credit_name(&a.name, name)))
+}
+
+/// クレジットに Genius artist ID を付ける。
+/// ID は別名の紐付けにしか使わないので、取れなくても取り込みは止めない（後から --backfill-genius-ids で埋められる）
+fn attach_genius_ids(client: &reqwest::blocking::Client, html: &str, info: &mut ScrapedSongInfo) {
+    let Some(song_id) = extract_song_id(html) else {
+        return;
+    };
+    let Ok(artists) = fetch_song_artists(client, song_id) else {
+        return;
+    };
+    for credit in &mut info.credits {
+        credit.genius_id = match_artist(&credit.name, &artists).map(|a| a.id);
+    }
+}
+
+/// 過去データの ID 補完用: 曲の song ID を探す。
+/// まず検索 API で引き、だめなら取り込み時と同じ URL 候補を順に開いてページから取り出す
+pub fn find_song_id(client: &reqwest::blocking::Client, artist: &str, track: &str) -> Result<Option<u64>> {
+    if let Some(id) = search_song_id(client, artist, track)? {
+        return Ok(Some(id));
+    }
+    for url in genius_url_candidates(artist, track) {
+        // Geniusに連打しない
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, html) = genius_get(client, &url)?;
+        if status.is_success() {
+            if let Some(id) = extract_song_id(&html) {
+                return Ok(Some(id));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 検索 API で曲を探す。
+/// 上位には翻訳・ローマ字表記のページ（"Genius-..." の URL）が並ぶので除外し、
+/// アーティスト名と曲名の両方が合うものだけを採る
+fn search_song_id(client: &reqwest::blocking::Client, artist: &str, track: &str) -> Result<Option<u64>> {
+    let url = reqwest::Url::parse_with_params(
+        "https://genius.com/api/search/song",
+        &[("q", format!("{} {}", artist, track))],
+    )?;
+    let resp = genius_api(client, url.as_str())?;
+
+    // "CHAERYEONG & ITZY" → "chaeryeong"。共演曲は先頭のアーティストだけで照合する
+    let main_artist = artist
+        .split(['&', ',', '('])
+        .next()
+        .unwrap_or(artist)
+        .split(" x ")
+        .next()
+        .unwrap_or(artist);
+    let artist_key = name_key(main_artist);
+    let track_key = name_key(track);
+    let track_core = name_key(&strip_trailing_parens(&strip_feat(track)));
+
+    let hits: Vec<&serde_json::Value> = resp["sections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|s| s["hits"].as_array().into_iter().flatten())
+        .map(|h| &h["result"])
+        .filter(|r| {
+            let url = r["url"].as_str().unwrap_or("");
+            let names = name_key(r["artist_names"].as_str().unwrap_or(""));
+            !url.starts_with("https://genius.com/Genius-")
+                && !artist_key.is_empty()
+                && names.contains(&artist_key)
+        })
+        .collect();
+
+    let title_key = |r: &serde_json::Value| name_key(r["title"].as_str().unwrap_or(""));
+    let found = hits
+        .iter()
+        .find(|r| title_key(r) == track_key)
+        .or_else(|| {
+            hits.iter()
+                .find(|r| !track_core.is_empty() && title_key(r).contains(&track_core))
+        });
+    Ok(found.and_then(|r| r["id"].as_u64()))
+}
+
+/// アーティストの別名（Genius の "Also known as"）。改名前の名前が残っていることが多い
+pub fn fetch_alternate_names(client: &reqwest::blocking::Client, artist_id: u64) -> Result<Vec<String>> {
+    let resp = genius_api(client, &format!("https://genius.com/api/artists/{}", artist_id))?;
+    Ok(resp["artist"]["alternate_names"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect())
+}
+
+/// 名前から Genius のアーティストページの URL 末尾を組み立てる（"Ido (DEU)" → "Ido-deu"）
+fn artist_slug(name: &str) -> String {
+    let ascii: String = fold_accents(name)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace() || *c == '-')
+        .collect();
+    let slug = ascii.split_whitespace().collect::<Vec<_>>().join("-").to_lowercase();
+    let mut chars = slug.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// 旧名のアーティストページを開いて、今の artist ID を返す。
+/// 改名・統合されたページは旧 URL から新 URL へ 301 で飛ぶので、
+/// 別名リストに旧名が残っていない改名（"Ido (DEU)" → "Ido (Producer)"）も辿れる。
+/// よくある名前だと同名の別人のページに当たるので、呼び出し側で曲のクレジットに含まれるか確かめること
+pub fn resolve_artist_by_old_name(client: &reqwest::blocking::Client, name: &str) -> Result<Option<u64>> {
+    let slug = artist_slug(name);
+    if slug.is_empty() {
+        return Ok(None);
+    }
+    // reqwest は既定でリダイレクトを辿る
+    let (status, html) = genius_get(client, &format!("https://genius.com/artists/{}", slug))?;
+    if !status.is_success() {
+        return Ok(None);
+    }
+    let re = Regex::new(r"Artist ID&quot;,&quot;value&quot;:(\d+)").unwrap();
+    Ok(re.captures(&html).and_then(|c| c[1].parse().ok()))
 }
 
 /// songbpm.comから「アーティスト 曲名」のBPM候補を取得。
@@ -1194,6 +1457,88 @@ mod tests {
     fn test_parse_date() {
         assert_eq!(parse_date("Jan 1, 2024"), Some("2024-01-01".to_string()));
         assert_eq!(parse_date("Dec. 25, 2023"), Some("2023-12-25".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod genius_id_tests {
+    use super::*;
+
+    #[test]
+    fn credit_name_variants() {
+        assert!(same_credit_name("ANNIE (ALLDAY PROJECT)", "Annie (ALLDAY PROJECT)"));
+        assert!(same_credit_name("DEE.P (KOR)", "Dee.P (KOR)"));
+        assert!(same_credit_name("KIGGEN (키겐)", "키겐 (Kiggen)"));
+        assert!(same_credit_name("Andrew Choi (앤드류최)", "앤드류 최 (Andrew Choi)"));
+        assert!(same_credit_name("pH-1", "\u{200B}pH-1"));
+        assert!(!same_credit_name("SEORA", "SEORA (설아) (KOR)"));
+        assert!(!same_credit_name("Ido (DEU)", "Ido (Producer)"));
+        assert!(!same_credit_name("!!!", "???"));
+    }
+
+    #[test]
+    fn match_artist_prefers_exact_name() {
+        let artists = vec![
+            GeniusArtist { id: 1, name: "Annie (ALLDAY PROJECT)".into(), is_writer: true },
+            GeniusArtist { id: 2, name: "ANNIE (ALLDAY PROJECT)".into(), is_writer: true },
+        ];
+        assert_eq!(match_artist("ANNIE (ALLDAY PROJECT)", &artists).map(|a| a.id), Some(2));
+        assert_eq!(match_artist("annie (allday project)", &artists).map(|a| a.id), Some(1));
+        assert!(match_artist("TARZZAN", &artists).is_none());
+    }
+
+    #[test]
+    fn slug_from_old_name() {
+        assert_eq!(artist_slug("Ido (DEU)"), "Ido-deu");
+        assert_eq!(artist_slug("Haewon (NMIXX)"), "Haewon-nmixx");
+        assert_eq!(artist_slug("TARZZAN (ALLDAY PROJECT)"), "Tarzzan-allday-project");
+        assert_eq!(artist_slug("J.Y. Park"), "Jy-park");
+        assert_eq!(artist_slug("조우찬 (WooChan)"), "Woochan");
+        assert_eq!(artist_slug("해원"), "");
+    }
+
+    #[test]
+    fn song_id_from_html() {
+        assert_eq!(
+            extract_song_id(r#"<meta content="genius://songs/8822028" name="twitter:app:url:iphone">"#),
+            Some(8822028)
+        );
+        assert_eq!(
+            extract_song_id(r#"[{\"value\":\"Song\",\"key\":\"Annotatable Type\"},{\"value\":8822028,\"key\":\"Annotatable ID\"}]"#),
+            Some(8822028)
+        );
+        assert_eq!(extract_song_id("<html></html>"), None);
+    }
+
+    #[test]
+    fn role_labels() {
+        assert_eq!(role_from_label("Composers"), Some("composer"));
+        assert_eq!(role_from_label("Lyrics"), Some("lyricist"));
+        assert_eq!(role_from_label("Mixing Engineer"), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_song_artists_and_old_names() {
+        let client = genius_client().unwrap();
+        let id = find_song_id(&client, "NMIXX", "Love Me Like This").unwrap().expect("song");
+        let artists = fetch_song_artists(&client, id).unwrap();
+        let haewon = artists.iter().find(|a| a.id == 3046012).expect("HAEWON");
+        println!("{} {:?}", id, haewon);
+        assert!(fetch_alternate_names(&client, 3046012).unwrap().iter().any(|n| n == "Haewon (NMIXX)"));
+        assert_eq!(resolve_artist_by_old_name(&client, "Ido (DEU)").unwrap(), Some(2517705));
+        // 翻訳ページしか上位に来ない曲も URL 候補で見つかる
+        assert!(find_song_id(&client, "CORTIS", "ACAI").unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore]
+    fn live_scrape_attaches_ids() {
+        let info = scrape_genius("https://genius.com/Nmixx-love-me-like-this-lyrics", &Config::default()).unwrap();
+        for c in &info.credits {
+            println!("{} {} {:?}", c.role, c.name, c.genius_id);
+        }
+        assert!(info.credits.iter().all(|c| c.genius_id.is_some()));
     }
 }
 

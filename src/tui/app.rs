@@ -1225,9 +1225,16 @@ impl App {
     }
 }
 
-/// WriterAka用: 単語一致でエイリアス候補ペアを自動検出
+/// WriterAka用: 単語一致でエイリアス候補ペアを自動検出。
+/// Genius artist ID が同じペアは取り込み時に自動で紐付くので出さない。
+/// ここに残るのは ID で判定できないもの（Genius 側で同じ人のページが分かれている等）
 fn compute_aka_pairs(db: &Database) -> Vec<(String, String, bool)> {
     let names = db.get_credit_names().unwrap_or_default();
+    let genius_ids = db.get_writer_genius_map().unwrap_or_default();
+    let same_genius_id = |a: &str, b: &str| match (genius_ids.get(a), genius_ids.get(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    };
 
     // 各名前から単語を抽出してインデックス構築
     let mut word_to_names: HashMap<String, Vec<String>> = HashMap::new();
@@ -1262,7 +1269,7 @@ fn compute_aka_pairs(db: &Database) -> Vec<(String, String, bool)> {
     // 非表示ペアを除外し、Aka状態を確認してAkaペアを先頭にソート
     let mut result: Vec<(String, String, bool)> = pairs
         .into_iter()
-        .filter(|(a, b)| !db.is_aka_dismissed(a, b))
+        .filter(|(a, b)| !same_genius_id(a, b) && !db.is_aka_dismissed(a, b))
         .map(|(a, b)| {
             let is_aka = db.is_aka_pair(&a, &b).unwrap_or(false);
             (a, b, is_aka)

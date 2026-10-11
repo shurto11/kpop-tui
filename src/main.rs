@@ -1,4 +1,4 @@
-use kpop_tui::{db, models, tui};
+use kpop_tui::{backfill, db, models, tui};
 
 use std::io;
 use std::path::PathBuf;
@@ -45,6 +45,12 @@ fn main() -> Result<()> {
     if args.len() >= 3 && args[1] == "--import-writer" {
         let count = db.import_writers_from_csv(&args[2])?;
         println!("Imported {} writer records.", count);
+        return Ok(());
+    }
+
+    // 取り込み済みのクレジット名に Genius artist ID を付け、同じ ID の名前を Aka に紐付ける
+    if args.len() >= 2 && args[1] == "--backfill-genius-ids" {
+        backfill::backfill_genius_ids(&db)?;
         return Ok(());
     }
 

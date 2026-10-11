@@ -148,6 +148,9 @@ impl WriterData {
 pub struct Credit {
     pub role: String,
     pub name: String,
+    /// Genius の artist ID。名前は改名で変わるが ID は変わらないので、別名の自動紐付けに使う。
+    /// API が取れなかったときは None（後から --backfill-genius-ids で埋められる）
+    pub genius_id: Option<u64>,
 }
 
 /// Geniusからスクレイピングした曲情報

@@ -106,6 +106,10 @@ Spotify のジャケット（ASCII アート）を表示する。該当曲がな
 - **CreditData** — Artist と Track を入力すると Genius をスクレイピングし、
   lyricist / composer / arranger / writer のクレジットを1人1行で登録する。
   アーティストが ArtistData に無ければ、そのまま ArtistData の入力に移る。
+
+  AutoAdd・CreditData どちらも、取り込み時に作家の **Genius artist ID** を記録する。
+  Genius では改名で名前や URL が変わっても ID は変わらないので、
+  既に別の名前で入っている作家と ID が一致すれば WriterAka に自動で紐付ける（追加時のメッセージに `Aka: ...` と出る）。
 - **TrackData** — TrackData が未入力の曲を Artist → Track の順に選ぶと、
   songbpm.com から Duration・BPM・Spotify URL を取得してフォームに入れる。
   BPM は「半分 / そのまま / 倍 / MIXX」から選ぶ（サイトの値は倍・半分にずれていることがあるため）。
@@ -113,6 +117,8 @@ Spotify のジャケット（ASCII アート）を表示する。該当曲がな
 - **WriterData** — 本名・生年月日・出身・職業・所属・デビュー・メモ。
 - **WriterAka** — クレジット名どうしで単語が一致するペアを一覧にし、`Space` で同一人物として紐付ける。
   紐付けた名前は WriterSearch で合算される。
+  Genius artist ID が同じペアは自動で紐付くので一覧に出ない。
+  ここで扱うのは ID では判定できないもの（Genius 側で同じ人のページが分かれている、ID 未取得など）。
 
 ### Search
 
@@ -179,6 +185,7 @@ Artist → Track を補完から選んで答える。`p` でパス。
 | `writer_data` | 作家のプロフィール |
 | `writer_aka` | 同一人物の別名（primary_name ↔ alias_name） |
 | `aka_dismissed` | WriterAka で一覧から外したペア |
+| `writer_genius` | クレジット名 → Genius artist ID |
 
 スキーマは起動時に自動で作成・マイグレーションされる。
 
@@ -191,7 +198,15 @@ kpop-tui --import-credit  <csv>   # CSV から credit_data に取り込む
 kpop-tui --import-track   <csv>   # track_data
 kpop-tui --import-artist  <csv>   # artist_data
 kpop-tui --import-writer  <csv>   # writer_data
+kpop-tui --backfill-genius-ids    # 取り込み済みの作家に Genius artist ID を付け、同じ ID の名前を Aka に紐付ける
 ```
+
+`--backfill-genius-ids` は、ID を記録するようになる前に取り込んだ曲のためのもの。
+ID の無い名前を含む曲を Genius で引き直し、今のクレジットと名前を突き合わせる。
+改名で名前が合わないときは、Genius の別名（Also known as）と、旧名のページ URL のリダイレクトで辿る。
+1曲ごとに保存するので途中で止めても次回は続きから進む（全曲で数十分かかる）。
+最後に、自動で紐付けた名前と、ID が付かなかった名前（WriterAka で手作業する対象）を一覧で出す。
+TUI を閉じてから実行すること。
 
 ## バックアップ
 

@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::models::{ArtistData, BpmTrackInfo, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
+use crate::models::{ArtistData, BpmTrackInfo, Credit, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
 use crate::scraper::{make_url, scrape_genius, search_songbpm};
 use crate::tui::app::{App, AutoAddBpmStatus, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS};
 
@@ -2622,6 +2622,7 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
                 }
             }
 
+            let aka_note = record_genius_ids(app, &info.credits);
             let date_warn = if info.date.is_none() { " [WARNING: date not found]" } else { "" };
 
             // アーティストがDBにない場合、ArtistData画面に遷移
@@ -2638,16 +2639,16 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
                 app.suggestions.clear();
                 // go_toがmessageをクリアするので、遷移後にメッセージをセット
                 app.show_message(&format!(
-                    "Added {} credits for '{}'.{} New artist '{}' - please register.",
-                    inserted, info.track, date_warn, artist
+                    "Added {} credits for '{}'.{} New artist '{}' - please register.{}",
+                    inserted, info.track, date_warn, artist, aka_note
                 ));
                 return;
             }
 
             if inserted > 0 {
                 app.show_message(&format!(
-                    "Added {} credits for '{}'{}",
-                    inserted, info.track, date_warn
+                    "Added {} credits for '{}'{}{}",
+                    inserted, info.track, date_warn, aka_note
                 ));
             } else {
                 app.show_message("No new credits found");
@@ -2664,6 +2665,35 @@ pub fn process_scrape_result(app: &mut App, result: Result<ScrapedSongInfo, Stri
         Err(e) => {
             app.show_error(&format!("Scraping failed: {}", e));
         }
+    }
+}
+
+/// 取り込んだクレジットの Genius artist ID を記録し、同じ ID の名前を Aka に紐付ける。
+/// 新しく紐付いた組があればメッセージの末尾に付ける文字列を返す（なければ空）
+fn record_genius_ids<'a>(app: &App, credits: impl IntoIterator<Item = &'a Credit>) -> String {
+    let mut pairs: Vec<(String, u64)> = Vec::new();
+    // 取り込んだ直後の名前は Genius 上の現在の名前
+    let mut current: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for c in credits {
+        if let Some(id) = c.genius_id {
+            pairs.push((c.name.clone(), id));
+            current.insert(id, c.name.clone());
+        }
+    }
+    if pairs.is_empty() || app.db.set_writer_genius_ids(&pairs).is_err() {
+        return String::new();
+    }
+
+    let ids: Vec<u64> = current.keys().copied().collect();
+    match app.db.sync_aka_for_genius_ids(&ids, &current) {
+        Ok(linked) if !linked.is_empty() => {
+            let list: Vec<String> = linked
+                .iter()
+                .map(|(primary, alias)| format!("{} ← {}", primary, alias))
+                .collect();
+            format!(" - Aka: {}", list.join(", "))
+        }
+        _ => String::new(),
     }
 }
 
@@ -3399,6 +3429,15 @@ fn handle_auto_add_commit(app: &mut App) {
         let _ = app.db.update_writer_count(name);
     }
 
+    let aka_note = record_genius_ids(
+        app,
+        app.auto_add_rows
+            .iter()
+            .filter(|r| r.status != AutoAddStatus::Duplicate && r.resolved_artist.is_some())
+            .filter_map(|r| r.info.as_ref())
+            .flat_map(|info| &info.credits),
+    );
+
     // 既にTrackDataがある曲は上書きしない（upsertだとgenresやAOTY/SOTYが消える）
     let mut track_added = 0usize;
     let mut track_failed = 0usize;
@@ -3422,6 +3461,7 @@ fn handle_auto_add_commit(app: &mut App) {
     if no_bpm > 0 {
         msg.push_str(&format!(" - {} without BPM: fill in InputTrackData", no_bpm));
     }
+    msg.push_str(&aka_note);
     if track_failed > 0 {
         app.show_error(&format!("{} - {} TrackData failed to save", msg, track_failed));
     } else {

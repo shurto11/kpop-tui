@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{ArtistData, TrackData, CreditData, WriterData, parse_genres, genres_to_string};
@@ -103,6 +104,13 @@ impl Database {
                 name_b TEXT NOT NULL,
                 UNIQUE(name_a, name_b)
             );
+
+            -- クレジット名 → Genius artist ID（同じIDの名前をWriterAkaに自動で紐付ける）
+            CREATE TABLE IF NOT EXISTS writer_genius (
+                name TEXT PRIMARY KEY,
+                genius_id INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_writer_genius_id ON writer_genius(genius_id);
 
             -- インデックス
             CREATE INDEX IF NOT EXISTS idx_song_artist ON credit_data(artist);
@@ -1640,6 +1648,199 @@ impl Database {
         Ok(())
     }
 
+    // ========== Genius artist ID ==========
+
+    /// クレジット名の Genius artist ID を記録する。
+    /// Genius が重複ページを統合すると同じ名前でも ID が変わるので、後から来た ID で上書きする
+    pub fn set_writer_genius_ids(&self, pairs: &[(String, u64)]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO writer_genius (name, genius_id) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET genius_id = excluded.genius_id",
+        )?;
+        for (name, id) in pairs {
+            stmt.execute(params![name, *id as i64])?;
+        }
+        Ok(())
+    }
+
+    /// クレジット名 → Genius artist ID の全件
+    pub fn get_writer_genius_map(&self) -> Result<HashMap<String, u64>> {
+        let mut stmt = self.conn.prepare("SELECT name, genius_id FROM writer_genius")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)))?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+    }
+
+    /// Genius artist ID が記録されている ID の一覧
+    pub fn get_all_genius_ids(&self) -> Result<Vec<u64>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT genius_id FROM writer_genius")?;
+        let rows = stmt.query_map([], |row| Ok(row.get::<_, i64>(0)? as u64))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// ID 補完の対象: Genius ID が未登録の名前を含む曲を、新しい順に (artist, track, 未登録の名前) で返す
+    pub fn get_tracks_missing_genius_ids(&self) -> Result<Vec<(String, String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.artist, c.track, c.name FROM credit_data c
+             LEFT JOIN writer_genius g ON g.name = c.name
+             WHERE g.name IS NULL AND c.name IS NOT NULL AND c.name != ''
+             GROUP BY c.artist, c.track, c.name
+             ORDER BY MAX(c.date) DESC, c.artist, c.track, c.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+
+        let mut tracks: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut index: HashMap<(String, String), usize> = HashMap::new();
+        for row in rows {
+            let (artist, track, name) = row?;
+            let i = *index.entry((artist.clone(), track.clone())).or_insert_with(|| {
+                tracks.push((artist, track, Vec::new()));
+                tracks.len() - 1
+            });
+            tracks[i].2.push(name);
+        }
+        Ok(tracks)
+    }
+
+    /// 同じ Genius artist ID を持つ名前どうしを writer_aka で紐付ける。戻り値は新たに紐付けた (primary, alias)。
+    ///
+    /// 手動で紐付けたグループが既にあればその primary に寄せる（別グループどうしなら1つにまとめる）。
+    /// なければ、プロフィール（writer_data）がある名前 → Genius の現在の名前 → クレジット数が多い名前 の順で primary を選ぶ。
+    /// current_names は ID → Genius 上の現在の名前
+    pub fn sync_aka_for_genius_ids(
+        &self,
+        ids: &[u64],
+        current_names: &HashMap<u64, String>,
+    ) -> Result<Vec<(String, String)>> {
+        self.conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<Vec<(String, String)>> {
+            let mut linked = Vec::new();
+            let mut stmt = self
+                .conn
+                .prepare("SELECT name FROM writer_genius WHERE genius_id = ?1 ORDER BY name")?;
+            for &id in ids {
+                let names = stmt
+                    .query_map([id as i64], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if names.len() < 2 {
+                    continue;
+                }
+
+                // 既存グループの primary。手動で別 ID の名前と紐付けていればグループ外の名前のこともある
+                let roots = names
+                    .iter()
+                    .map(|n| self.aka_root(n))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut existing = Vec::new();
+                for (name, root) in names.iter().zip(&roots) {
+                    if root != name || self.has_aliases(name)? {
+                        existing.push(root.clone());
+                    }
+                }
+                existing.sort();
+                existing.dedup();
+
+                let pool = if existing.is_empty() { &names } else { &existing };
+                let primary = self.pick_aka_primary(pool, current_names.get(&id))?;
+
+                for (name, root) in names.iter().zip(&roots) {
+                    if *name == primary {
+                        continue;
+                    }
+                    if *root != primary {
+                        self.merge_aka_group(&primary, root)?;
+                        linked.push((primary.clone(), name.clone()));
+                    }
+                    // 鎖の途中にいる名前は primary の直下に付け替える（集計 SQL は別名を1段しか辿らない）
+                    if self.get_primary_name(name)? != primary {
+                        self.conn.execute("DELETE FROM writer_aka WHERE alias_name = ?1", [name])?;
+                        self.merge_aka_group(&primary, name)?;
+                    }
+                }
+            }
+            Ok(linked)
+        })();
+
+        match result {
+            Ok(linked) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(linked)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// alias → primary を根まで辿る。
+    /// toggle_writer_aka は alias 側を primary にした組も作れるので鎖になっていることがある（循環対策で上限つき）
+    fn aka_root(&self, name: &str) -> Result<String> {
+        let mut cur = name.to_string();
+        for _ in 0..16 {
+            let next = self.conn.query_row(
+                "SELECT primary_name FROM writer_aka WHERE alias_name = ?1 AND primary_name != ?1",
+                [&cur],
+                |row| row.get::<_, String>(0),
+            );
+            match next {
+                Ok(p) => cur = p,
+                Err(rusqlite::Error::QueryReturnedNoRows) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(cur)
+    }
+
+    fn has_aliases(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM writer_aka WHERE primary_name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        Ok(n != 0)
+    }
+
+    /// primary 候補から1つ選ぶ。
+    /// プロフィールは名前で引くので、プロフィールがある名前を primary にしないと WriterSearch から見えなくなる
+    fn pick_aka_primary(&self, pool: &[String], current: Option<&String>) -> Result<String> {
+        let mut best: Option<((bool, bool, i64), &String)> = None;
+        for name in pool {
+            let has_profile: i64 = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_data WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            let credits: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM credit_data WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+            let score = (has_profile != 0, current == Some(name), credits);
+            // pool は名前順なので、同点なら名前順で先のものが残る
+            if best.map_or(true, |(s, _)| score > s) {
+                best = Some((score, name));
+            }
+        }
+        best.map(|(_, n)| n.clone())
+            .ok_or_else(|| anyhow::anyhow!("No primary candidates"))
+    }
+
+    /// root と、root の alias をまとめて primary の alias にする
+    fn merge_aka_group(&self, primary: &str, root: &str) -> Result<()> {
+        if primary == root {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO writer_aka (primary_name, alias_name)
+             SELECT ?1, alias_name FROM writer_aka WHERE primary_name = ?2 AND alias_name != ?1",
+            params![primary, root],
+        )?;
+        self.conn.execute("DELETE FROM writer_aka WHERE primary_name = ?1", [root])?;
+        self.add_writer_aka(primary, root)
+    }
+
     /// 全テーブルをCSVにエクスポート
     pub fn export_all_csv(&self, dir: &Path) -> Result<(usize, usize, usize, usize, usize)> {
         let c1 = self.export_credits_csv(&dir.join("credit.csv"))?;
@@ -1785,4 +1986,123 @@ impl Database {
 /// IN句用のプレースホルダーを生成 (e.g. "?1, ?2, ?3")
 fn make_placeholders(count: usize) -> String {
     (1..=count).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(", ")
+}
+
+#[cfg(test)]
+mod genius_aka_tests {
+    use super::*;
+
+    fn db_with_credits(names: &[(&str, i64)]) -> Database {
+        let db = Database::open(":memory:").unwrap();
+        for (name, credits) in names {
+            for i in 0..*credits {
+                db.conn
+                    .execute(
+                        "INSERT INTO credit_data (artist, track, role, name) VALUES ('A', ?1, 'composer', ?2)",
+                        params![format!("t{}", i), name],
+                    )
+                    .unwrap();
+            }
+        }
+        db
+    }
+
+    fn ids(db: &Database, pairs: &[(&str, u64)]) -> Vec<u64> {
+        let pairs: Vec<(String, u64)> = pairs.iter().map(|(n, i)| (n.to_string(), *i)).collect();
+        db.set_writer_genius_ids(&pairs).unwrap();
+        let mut v: Vec<u64> = pairs.iter().map(|p| p.1).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn links_same_id_with_current_name_as_primary() {
+        let db = db_with_credits(&[("Haewon (NMIXX)", 5), ("HAEWON (해원)", 1), ("Other", 1)]);
+        let all = ids(&db, &[("Haewon (NMIXX)", 1), ("HAEWON (해원)", 1), ("Other", 2)]);
+        let current = HashMap::from([(1, "HAEWON (해원)".to_string())]);
+
+        let linked = db.sync_aka_for_genius_ids(&all, &current).unwrap();
+        assert_eq!(linked, vec![("HAEWON (해원)".to_string(), "Haewon (NMIXX)".to_string())]);
+        assert_eq!(db.get_primary_name("Haewon (NMIXX)").unwrap(), "HAEWON (해원)");
+
+        // 2回目は何もしない
+        assert!(db.sync_aka_for_genius_ids(&all, &current).unwrap().is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_most_credits_without_current_name() {
+        let db = db_with_credits(&[("a", 1), ("b", 3)]);
+        let all = ids(&db, &[("a", 1), ("b", 1)]);
+        db.sync_aka_for_genius_ids(&all, &HashMap::new()).unwrap();
+        assert_eq!(db.get_primary_name("a").unwrap(), "b");
+    }
+
+    #[test]
+    fn keeps_name_with_profile_as_primary() {
+        let db = db_with_credits(&[("Old", 1), ("New", 1)]);
+        db.upsert_writer(&WriterData::new("Old".to_string())).unwrap();
+        let all = ids(&db, &[("Old", 1), ("New", 1)]);
+        let current = HashMap::from([(1, "New".to_string())]);
+
+        db.sync_aka_for_genius_ids(&all, &current).unwrap();
+        assert_eq!(db.get_primary_name("New").unwrap(), "Old");
+    }
+
+    #[test]
+    fn joins_existing_manual_group() {
+        // 手動で P ← X を紐付け済み。Y が X と同じ ID なら P のグループに入る
+        let db = db_with_credits(&[("P", 1), ("X", 1), ("Y", 1)]);
+        db.add_writer_aka("P", "X").unwrap();
+        let all = ids(&db, &[("X", 1), ("Y", 1)]);
+        let current = HashMap::from([(1, "Y".to_string())]);
+
+        let linked = db.sync_aka_for_genius_ids(&all, &current).unwrap();
+        assert_eq!(linked, vec![("P".to_string(), "Y".to_string())]);
+        assert_eq!(db.get_primary_name("Y").unwrap(), "P");
+        assert_eq!(db.get_primary_name("X").unwrap(), "P");
+    }
+
+    #[test]
+    fn merges_two_manual_groups() {
+        // P1 ← X, P2 ← Y, Z。X と Y が同じ ID なら1つのグループにまとまる
+        let db = db_with_credits(&[("P1", 5), ("X", 1), ("P2", 1), ("Y", 1), ("Z", 1)]);
+        db.add_writer_aka("P1", "X").unwrap();
+        db.add_writer_aka("P2", "Y").unwrap();
+        db.add_writer_aka("P2", "Z").unwrap();
+        let all = ids(&db, &[("X", 1), ("Y", 1)]);
+
+        db.sync_aka_for_genius_ids(&all, &HashMap::new()).unwrap();
+        for name in ["X", "P2", "Y", "Z"] {
+            assert_eq!(db.get_primary_name(name).unwrap(), "P1", "{}", name);
+        }
+        let mut names = db.get_all_names_for_writer("Z").unwrap();
+        names.sort();
+        assert_eq!(names, vec!["P1", "P2", "X", "Y", "Z"]);
+    }
+
+    #[test]
+    fn follows_alias_chain_to_root() {
+        // toggle_writer_aka で X ← Y の鎖ができていても、根の P に寄せる
+        let db = db_with_credits(&[("P", 1), ("X", 1), ("Y", 1), ("W", 1)]);
+        db.add_writer_aka("P", "X").unwrap();
+        db.add_writer_aka("X", "Y").unwrap();
+        let all = ids(&db, &[("Y", 1), ("W", 1)]);
+
+        db.sync_aka_for_genius_ids(&all, &HashMap::new()).unwrap();
+        assert_eq!(db.get_primary_name("W").unwrap(), "P");
+        assert_eq!(db.get_primary_name("Y").unwrap(), "P");
+    }
+
+    #[test]
+    fn later_id_overwrites_and_missing_tracks_are_listed() {
+        let db = db_with_credits(&[("a", 2), ("b", 1)]);
+        ids(&db, &[("a", 1)]);
+        ids(&db, &[("a", 9)]);
+        assert_eq!(db.get_writer_genius_map().unwrap().get("a"), Some(&9));
+
+        let missing = db.get_tracks_missing_genius_ids().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].2, vec!["b".to_string()]);
+    }
 }
