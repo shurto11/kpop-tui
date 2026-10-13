@@ -960,6 +960,9 @@ fn draw_auto_add(frame: &mut Frame, app: &mut App, area: Rect) {
     let end = (app.list_offset + app.visible_rows).min(app.auto_add_rows.len());
     let visible = &app.auto_add_rows[app.list_offset..end];
 
+    // 編集中のセルに出すカーソル位置（枠内の列, 表示行）
+    let mut edit_cursor: Option<(u16, u16)> = None;
+
     let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
@@ -990,7 +993,15 @@ fn draw_auto_add(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(" "),
             ];
 
+            // 編集欄の手前までの表示幅 + ">" の1桁 + カーソルまでの幅
+            let cursor_col = |spans: &[Span]| {
+                spans.iter().map(|s| s.width() as u16).sum::<u16>()
+                    + 1
+                    + display_width_up_to(&app.edit_buffer, app.edit_cursor)
+            };
+
             if editing_track {
+                edit_cursor = Some((cursor_col(&spans), i as u16));
                 spans.push(Span::styled(
                     format!(">{}", app.edit_buffer),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -1002,6 +1013,7 @@ fn draw_auto_add(frame: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled("  —  ", Style::default().fg(Color::DarkGray)));
 
             if editing_artist {
+                edit_cursor = Some((cursor_col(&spans), i as u16));
                 spans.push(Span::styled(
                     format!(">{}", app.edit_buffer),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -1073,6 +1085,12 @@ fn draw_auto_add(frame: &mut Frame, app: &mut App, area: Rect) {
             .border_style(list_border),
     );
     frame.render_widget(list, area);
+
+    if let Some((col, row)) = edit_cursor {
+        // 行が枠からはみ出す長さでも、カーソルは枠の内側に留める
+        let max_col = area.width.saturating_sub(3);
+        frame.set_cursor_position((area.x + 1 + col.min(max_col), area.y + 1 + row));
+    }
 
     if let Some(row) = app.auto_add_rows.get(app.list_index) {
         let selected = app.auto_add_detail_focus.then_some(app.auto_add_detail_index);
