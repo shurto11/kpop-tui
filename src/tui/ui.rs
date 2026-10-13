@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use chrono::{Datelike, Local, NaiveDate};
-use crate::tui::app::{App, AutoAddBpmStatus, AutoAddPhase, AutoAddRow, AutoAddStatus, Mode, Screen, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS};
+use crate::tui::app::{App, AutoAddBpmStatus, AutoAddPhase, AutoAddRow, AutoAddStatus, Mode, Screen, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS, TRACK_COLUMNS};
 
 /// AOTY/SOTY用の金色
 const GOLD: Color = Color::Rgb(255, 215, 0);
@@ -371,7 +371,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "j/k: Move  l: Writer  /: Search  h: Back  q: Menu  Q/^C: Quit"
                 }
                 Screen::ViewTrackData => {
-                    "j/k: Move  l: Detail  e: Edit  s: SOTY  a: AOTY  S: Toggle SOTY  A: Toggle AOTY  c: Play  /: Search  h: Back"
+                    "j/k: Move  h/l: Column  s: Sort  S/A: SOTY/AOTY only  y: Toggle AOTY (Album) / SOTY (Track)  Enter: Detail  e: Edit  c: Play  /: Search  Esc: Back"
                 }
                 Screen::ViewArtistData => {
                     "j/k: Move  v: Visual  e: Edit  u: Undo  Ctrl+r: Redo  /: Search  h: Back  q: Menu"
@@ -1724,9 +1724,20 @@ fn draw_writer_table(frame: &mut Frame, app: &App, area: Rect) {
 
 /// TrackDataテーブル
 fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Rel", "Plays"])
-        .style(Style::default().add_modifier(Modifier::BOLD))
-        .height(1);
+    // 選択中の列は黄色、並べ替え中の列には向きを付ける
+    let header = Row::new(TRACK_COLUMNS.iter().enumerate().map(|(i, name)| {
+        let label = match app.track_sort {
+            Some((col, desc)) if col == i => format!("{} {}", name, if desc { "▼" } else { "▲" }),
+            _ => name.to_string(),
+        };
+        if i == app.track_column {
+            Cell::from(label).style(Style::default().fg(Color::Yellow))
+        } else {
+            Cell::from(label)
+        }
+    }))
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .height(1);
 
     // list_offsetからvisible_rows分だけスライス
     let end = (app.list_offset + app.visible_rows).min(app.tracks.len());
@@ -1749,16 +1760,7 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "-"
             };
-            let album_cell = if track.is_aoty {
-                Cell::from(track.album.clone().unwrap_or_default()).style(Style::default().fg(GOLD))
-            } else {
-                Cell::from(track.album.clone().unwrap_or_default())
-            };
-            let track_cell = if track.is_soty {
-                Cell::from(track.track.clone()).style(Style::default().fg(GOLD))
-            } else {
-                Cell::from(track.track.clone())
-            };
+            let gold = |on: bool| if on { Style::default().fg(GOLD) } else { Style::default() };
             let genre_display = track.genres.as_ref()
                 .map(|g| crate::models::genres_display(g))
                 .unwrap_or_default();
@@ -1767,18 +1769,27 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
                 .get(&(track.artist.clone(), track.track.clone()))
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            Row::new(vec![
-                Cell::from(track.artist.clone()),
-                Cell::from(track.label.clone().unwrap_or_default()),
-                Cell::from(track.date.clone().unwrap_or_default()),
-                album_cell,
-                track_cell,
-                Cell::from(genre_display),
-                Cell::from(duration),
-                Cell::from(track.bpm.clone().unwrap_or_default()),
-                Cell::from(release.to_string()),
-                Cell::from(plays),
-            ])
+            let cells = [
+                (track.artist.clone(), Style::default()),
+                (track.label.clone().unwrap_or_default(), Style::default()),
+                (track.date.clone().unwrap_or_default(), Style::default()),
+                (track.album.clone().unwrap_or_default(), gold(track.is_aoty)),
+                (track.track.clone(), gold(track.is_soty)),
+                (genre_display, Style::default()),
+                (duration, Style::default()),
+                (track.bpm.clone().unwrap_or_default(), Style::default()),
+                (release.to_string(), Style::default()),
+                (plays, Style::default()),
+            ];
+            Row::new(cells.into_iter().enumerate().map(|(col, (text, cell_style))| {
+                // カーソル行の選択中の列を反転させる
+                let cell_style = if actual_index == app.list_index && col == app.track_column {
+                    cell_style.add_modifier(Modifier::REVERSED)
+                } else {
+                    cell_style
+                };
+                Cell::from(text).style(cell_style)
+            }))
             .style(style)
         })
         .collect();

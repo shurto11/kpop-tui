@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::models::{ArtistData, BpmTrackInfo, Credit, CreditData, ScrapedSongInfo, TrackData, WriterData, parse_genres, genres_to_string};
 use crate::scraper::{make_url, scrape_genius, search_songbpm};
-use crate::tui::app::{App, AutoAddBpmStatus, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS};
+use crate::tui::app::{App, AutoAddBpmStatus, AutoAddMsg, AutoAddPhase, AutoAddRow, AutoAddStatus, FormField, Mode, Screen, TrackFilter, AUTO_ADD_DETAIL_FIELDS, RELEASE_OPTIONS, TRACK_COLUMNS};
 
 /// キー入力を処理
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -67,6 +67,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         if app.auto_add_detail_focus && handle_auto_add_detail_key(app, key) {
             return;
         }
+    }
+
+    // ViewTrackData: h/lで列を移動、sで並べ替え、yでAOTY/SOTY、S/Aで絞り込み
+    if matches!(app.screen, Screen::ViewTrackData) && handle_track_table_key(app, key) {
+        return;
     }
 
     // ViewLog: 削除確認待ち (y/n)
@@ -265,18 +270,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             search_prev(app);
         }
 
-        // a: AOTYフィルタ (ViewTrackData) / 次のBPMマッチ (InputTrackData)
+        // a: 次のBPMマッチ (InputTrackData)
         KeyCode::Char('a') => {
-            if matches!(app.screen, Screen::ViewTrackData) {
-                app.track_filter = if app.track_filter == TrackFilter::Aoty {
-                    TrackFilter::All
-                } else {
-                    TrackFilter::Aoty
-                };
-                app.list_index = 0;
-                app.list_offset = 0;
-                reload_tracks(app);
-            } else if matches!(app.screen, Screen::InputTrackData)
+            if matches!(app.screen, Screen::InputTrackData)
                 && !app.form_fields.is_empty()
                 && app.bpm_matches.len() > 1
             {
@@ -285,46 +281,6 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             } else if matches!(app.screen, Screen::InputAutoAdd) {
                 handle_auto_add_next_bpm_match(app);
             }
-        }
-
-
-        // s: SOTYフィルタ (ViewTrackData)
-        KeyCode::Char('s') => {
-            if matches!(app.screen, Screen::ViewTrackData) {
-                app.track_filter = if app.track_filter == TrackFilter::Soty {
-                    TrackFilter::All
-                } else {
-                    TrackFilter::Soty
-                };
-                app.list_index = 0;
-                app.list_offset = 0;
-                reload_tracks(app);
-            }
-        }
-
-        // AOTYトグル
-        KeyCode::Char('A') => {
-            if matches!(app.screen, Screen::ViewTrackData) {
-                if let Some(item) = app.tracks.get(app.list_index) {
-                    let artist = item.artist.clone();
-                    let track = item.track.clone();
-                    match app.db.toggle_aoty(&artist, &track) {
-                        Ok(is_aoty) => {
-                            let status = if is_aoty { "ON" } else { "OFF" };
-                            app.show_message(&format!("AOTY {} for '{}'", status, track));
-                            reload_tracks(app);
-                        }
-                        Err(e) => {
-                            app.show_error(&format!("Failed: {}", e));
-                        }
-                    }
-                }
-            }
-        }
-
-        // SOTYトグル
-        KeyCode::Char('S') => {
-            handle_space(app);
         }
 
         // ViewLog: 削除 (y/nで確認) / WriterAka: 非表示
@@ -937,13 +893,91 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// フィルタに応じてTrackDataリストを再取得
-fn reload_tracks(app: &mut App) {
-    app.tracks = match app.track_filter {
-        TrackFilter::Soty => app.db.get_soty().unwrap_or_default(),
-        TrackFilter::Aoty => app.db.get_aoty().unwrap_or_default(),
-        TrackFilter::All => app.db.get_all_track_data().unwrap_or_default(),
+/// ViewTrackData: 列の移動・並べ替え・絞り込み・AOTY/SOTY・詳細。処理したらtrue
+fn handle_track_table_key(app: &mut App, key: KeyEvent) -> bool {
+    // ←/→ は再生中ならシークに回す（他の画面と同じ）
+    let code = match key.code {
+        KeyCode::Left if !app.spotify_playing => KeyCode::Char('h'),
+        KeyCode::Right if !app.spotify_playing => KeyCode::Char('l'),
+        code => code,
     };
+    match code {
+        KeyCode::Char('h') => {
+            app.track_column = app.track_column.saturating_sub(1);
+        }
+        KeyCode::Char('l') => {
+            app.track_column = (app.track_column + 1).min(TRACK_COLUMNS.len() - 1);
+        }
+        // 同じ列なら昇順⇄降順、別の列なら昇順から
+        KeyCode::Char('s') => {
+            let desc = app.track_sort == Some((app.track_column, false));
+            app.track_sort = Some((app.track_column, desc));
+            app.list_index = 0;
+            app.list_offset = 0;
+            reload_tracks(app);
+        }
+        // SOTY/AOTYだけに絞り込む。もう一度押すと解除。並べ替えはそのまま
+        KeyCode::Char('S') | KeyCode::Char('A') => {
+            let filter = if code == KeyCode::Char('S') { TrackFilter::Soty } else { TrackFilter::Aoty };
+            app.track_filter = if app.track_filter == filter { TrackFilter::All } else { filter };
+            app.list_index = 0;
+            app.list_offset = 0;
+            reload_tracks(app);
+        }
+        KeyCode::Char('y') => {
+            toggle_track_aoty_soty(app);
+        }
+        // 詳細（SearchTrackResult）へ
+        KeyCode::Enter => {
+            if let Some(t) = app.tracks.get(app.list_index) {
+                let artist = t.artist.clone();
+                let track = t.track.clone();
+                app.go_to(Screen::SearchTrackResult { artist, track });
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// ViewTrackData: 選択中の列がAlbumならAOTY、TrackならSOTYを切り替える
+fn toggle_track_aoty_soty(app: &mut App) {
+    let Some(item) = app.tracks.get(app.list_index) else {
+        return;
+    };
+    let artist = item.artist.clone();
+    let track = item.track.clone();
+    let result = match TRACK_COLUMNS[app.track_column] {
+        "Album" => app.db.toggle_aoty(&artist, &track).map(|on| ("AOTY", on)),
+        "Track" => app.db.toggle_soty(&artist, &track).map(|on| ("SOTY", on)),
+        _ => {
+            app.show_message("y: AOTY on Album, SOTY on Track");
+            return;
+        }
+    };
+    match result {
+        Ok((kind, on)) => {
+            let status = if on { "ON" } else { "OFF" };
+            app.show_message(&format!("{} {} for '{}'", kind, status, track));
+            // 絞り込み中に外した曲は一覧から消える
+            reload_tracks(app);
+        }
+        Err(e) => {
+            app.show_error(&format!("Failed: {}", e));
+        }
+    }
+}
+
+/// ViewTrackDataを読み直す。カーソルは今の位置のまま（はみ出したら末尾へ）
+fn reload_tracks(app: &mut App) {
+    app.load_tracks();
+    app.list_index = app.list_index.min(app.tracks.len().saturating_sub(1));
+    app.list_offset = app.list_offset.min(app.list_index);
+    // 並びが変わったので検索ヒットの位置を取り直す
+    if !app.search_query.is_empty() {
+        execute_search(app);
+        app.search_match_pos = 0;
+    }
 }
 
 /// Artist操作のUndo
@@ -1482,12 +1516,6 @@ fn handle_enter_insert_or_select(app: &mut App) {
         // ViewWriterData: SearchWriterResultに遷移
         let name = app.writers[app.list_index].name.clone();
         app.go_to(Screen::SearchWriterResult { name });
-    } else if matches!(app.screen, Screen::ViewTrackData) && !app.tracks.is_empty() {
-        // ViewTrackData/ViewBest16: SearchTrackResultに遷移
-        let t = &app.tracks[app.list_index];
-        let artist = t.artist.clone();
-        let track = t.track.clone();
-        app.go_to(Screen::SearchTrackResult { artist, track });
     } else if matches!(app.screen, Screen::SearchTrackResult { .. }) && !app.search_results.is_empty() {
         // SearchTrackResult: 選択したCreditのnameでSearchWriterResultに遷移
         if let Some(name) = app.search_results.get(app.list_index).and_then(|c| c.name.clone()) {
@@ -2084,29 +2112,6 @@ fn update_suggestions(app: &mut App) {
         _ => {}
     }
     app.suggestion_index = 0;
-}
-
-/// スペースキー（Best16トグル等）
-fn handle_space(app: &mut App) {
-    match &app.screen {
-        Screen::ViewTrackData => {
-            if let Some(item) = app.tracks.get(app.list_index) {
-                let artist = item.artist.clone();
-                let track = item.track.clone();
-                match app.db.toggle_soty(&artist, &track) {
-                    Ok(is_best) => {
-                        let status = if is_best { "ON" } else { "OFF" };
-                        app.show_message(&format!("SOTY {} for '{}'", status, track));
-                        reload_tracks(app);
-                    }
-                    Err(e) => {
-                        app.show_error(&format!("Failed: {}", e));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 /// URLを開く

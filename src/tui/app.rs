@@ -95,6 +95,10 @@ pub struct App {
     pub writers: Vec<WriterData>,
     pub tracks: Vec<TrackData>,
     pub track_filter: TrackFilter,
+    /// ViewTrackDataの選択中の列（TRACK_COLUMNSの添字）
+    pub track_column: usize,
+    /// ViewTrackDataの並び替え: (列, 降順か)。Noneなら既定の並び
+    pub track_sort: Option<(usize, bool)>,
 
     // 検索結果
     pub search_results: Vec<CreditData>,
@@ -380,6 +384,27 @@ pub enum TrackFilter {
     Aoty,
 }
 
+/// ViewTrackDataの列
+pub const TRACK_COLUMNS: [&str; 10] =
+    ["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Rel", "Plays"];
+
+/// ViewTrackDataの並び替えキー。空欄は昇順・降順どちらでも末尾に置く
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TrackSortKey {
+    Num(i64),
+    Text(String),
+    Empty,
+}
+
+impl TrackSortKey {
+    fn text(s: Option<&str>) -> Self {
+        match s {
+            Some(s) if !s.is_empty() => Self::Text(s.to_lowercase()),
+            _ => Self::Empty,
+        }
+    }
+}
+
 /// ArtistData操作（undo/redo用）
 #[derive(Debug, Clone)]
 pub enum ArtistAction {
@@ -483,6 +508,8 @@ impl App {
             writers: Vec::new(),
             tracks: Vec::new(),
             track_filter: TrackFilter::All,
+            track_column: 0,
+            track_sort: None,
             search_results: Vec::new(),
             search_track_data: None,
             search_artist_label: None,
@@ -560,6 +587,20 @@ impl App {
         };
         app.load_screen_data();
         app
+    }
+
+    /// ViewTrackDataの一覧を読み直し、track_filterで絞り込んでtrack_sortの列で並べ替える
+    pub fn load_tracks(&mut self) {
+        let mut tracks = self.db.get_all_track_data().unwrap_or_default();
+        match self.track_filter {
+            TrackFilter::All => {}
+            TrackFilter::Soty => tracks.retain(|t| t.is_soty),
+            TrackFilter::Aoty => tracks.retain(|t| t.is_aoty),
+        }
+        self.tracks = match self.track_sort {
+            Some((column, desc)) => sort_tracks(tracks, column, desc, &self.play_counts),
+            None => tracks,
+        };
     }
 
     /// ViewTrackDataのPlays列を数え直す
@@ -785,7 +826,11 @@ impl App {
         self.pending_g = false;
         self.pending_j = false;
         self.selecting_suggestion = false;
-        self.track_filter = TrackFilter::All;
+        if self.screen == Screen::ViewTrackData {
+            self.track_filter = TrackFilter::All;
+            self.track_column = 0;
+            self.track_sort = None;
+        }
         self.aka_pairs.clear();
         self.update_menu_items();
         self.load_screen_data();
@@ -820,7 +865,6 @@ impl App {
             self.pending_g = false;
             self.pending_j = false;
             self.selecting_suggestion = false;
-            self.track_filter = TrackFilter::All;
             self.update_menu_items();
             self.load_screen_data();
             // load_screen_dataがモードを上書きする場合があるのでNormalに戻す
@@ -1062,8 +1106,9 @@ impl App {
                 self.writer_data_names = self.db.get_writer_data_names().unwrap_or_default();
             }
             Screen::ViewTrackData => {
-                self.tracks = self.db.get_all_track_data().unwrap_or_default();
+                // Plays列で並べ替えるので先に数える
                 self.refresh_play_counts();
+                self.load_tracks();
             }
             Screen::ViewArtistData => {
                 self.artists = self.db.get_artists_sorted().unwrap_or_default();
@@ -1285,6 +1330,60 @@ impl App {
     }
 }
 
+/// TrackDataをTRACK_COLUMNS[column]の値で並べ替える。
+/// 同じ値どうしは渡された並び（既定ならアーティスト順・日付順）のまま
+fn sort_tracks(
+    tracks: Vec<TrackData>,
+    column: usize,
+    desc: bool,
+    play_counts: &HashMap<TrackKey, i64>,
+) -> Vec<TrackData> {
+    // Artistは五十音順ではなくArtistDataで並べた順（既定の並び）にする
+    let mut artist_rank: HashMap<String, i64> = HashMap::new();
+    for t in &tracks {
+        let next = artist_rank.len() as i64;
+        artist_rank.entry(t.artist.clone()).or_insert(next);
+    }
+
+    let mut keyed: Vec<(TrackSortKey, TrackData)> = tracks
+        .into_iter()
+        .map(|t| {
+            let key = match TRACK_COLUMNS[column] {
+                "Artist" => TrackSortKey::Num(artist_rank[&t.artist]),
+                "Label" => TrackSortKey::text(t.label.as_deref()),
+                "Date" => TrackSortKey::text(t.date.as_deref()),
+                "Album" => TrackSortKey::text(t.album.as_deref()),
+                "Track" => TrackSortKey::text(Some(&t.track)),
+                "Genre" => TrackSortKey::text(
+                    t.genres.as_ref().map(|g| crate::models::genres_display(g)).as_deref(),
+                ),
+                "Dur" => t.duration.map_or(TrackSortKey::Empty, TrackSortKey::Num),
+                // MIXXなど数値でないものは数値の後ろ
+                "BPM" => match t.bpm.as_deref().map(|b| b.parse::<i64>()) {
+                    Some(Ok(n)) => TrackSortKey::Num(n),
+                    _ => TrackSortKey::text(t.bpm.as_deref()),
+                },
+                "Rel" if t.is_title => TrackSortKey::Num(0),
+                "Rel" if t.is_prerelease => TrackSortKey::Num(1),
+                "Rel" => TrackSortKey::Empty,
+                "Plays" => TrackSortKey::Num(
+                    play_counts.get(&(t.artist.clone(), t.track.clone())).copied().unwrap_or(0),
+                ),
+                _ => TrackSortKey::Empty,
+            };
+            (key, t)
+        })
+        .collect();
+    keyed.sort_by(|(a, _), (b, _)| match (a, b) {
+        (TrackSortKey::Empty, TrackSortKey::Empty) => std::cmp::Ordering::Equal,
+        (TrackSortKey::Empty, _) => std::cmp::Ordering::Greater,
+        (_, TrackSortKey::Empty) => std::cmp::Ordering::Less,
+        _ if desc => b.cmp(a),
+        _ => a.cmp(b),
+    });
+    keyed.into_iter().map(|(_, t)| t).collect()
+}
+
 /// WriterAka用: 単語一致でエイリアス候補ペアを自動検出。
 /// Genius artist ID が同じペアは取り込み時に自動で紐付くので出さない。
 /// ここに残るのは ID で判定できないもの（Genius 側で同じ人のページが分かれている等）
@@ -1411,5 +1510,81 @@ mod auto_add_row_tests {
         assert_eq!(r.bpm_value(), None);
         r.bpm_choice = 1;
         assert_eq!(r.bpm_value().as_deref(), Some("MIXX"));
+    }
+}
+
+#[cfg(test)]
+mod sort_tracks_tests {
+    use super::*;
+
+    fn track(artist: &str, name: &str) -> TrackData {
+        TrackData::new(name.into(), artist.into())
+    }
+
+    fn col(name: &str) -> usize {
+        TRACK_COLUMNS.iter().position(|c| *c == name).unwrap()
+    }
+
+    fn names(tracks: &[TrackData]) -> Vec<&str> {
+        tracks.iter().map(|t| t.track.as_str()).collect()
+    }
+
+    #[test]
+    fn album_sorts_by_name_keeping_default_order_for_ties() {
+        let album = |artist: &str, name: &str, album: Option<&str>| {
+            let mut t = track(artist, name);
+            t.album = album.map(Into::into);
+            t
+        };
+        let tracks = vec![
+            album("x", "a", Some("beta")),
+            album("x", "b", Some("Alpha")),
+            album("y", "c", None),
+            album("y", "d", Some("beta")),
+        ];
+
+        let asc = sort_tracks(tracks.clone(), col("Album"), false, &HashMap::new());
+        assert_eq!(names(&asc), vec!["b", "a", "d", "c"]);
+        let desc = sort_tracks(tracks, col("Album"), true, &HashMap::new());
+        assert_eq!(names(&desc), vec!["a", "d", "b", "c"]);
+    }
+
+    #[test]
+    fn blanks_stay_last_in_both_directions() {
+        let mut a = track("x", "a");
+        a.bpm = Some("120".into());
+        let mut b = track("x", "b");
+        b.bpm = Some("MIXX".into());
+        let c = track("x", "c");
+        let mut d = track("x", "d");
+        d.bpm = Some("95".into());
+        let tracks = vec![a, b, c, d];
+
+        let asc = sort_tracks(tracks.clone(), col("BPM"), false, &HashMap::new());
+        assert_eq!(names(&asc), vec!["d", "a", "b", "c"]);
+        let desc = sort_tracks(tracks, col("BPM"), true, &HashMap::new());
+        assert_eq!(names(&desc), vec!["b", "a", "d", "c"]);
+    }
+
+    #[test]
+    fn artist_keeps_artist_data_order_and_reverses_groups() {
+        let tracks = vec![track("zz", "1"), track("zz", "2"), track("aa", "3")];
+
+        let asc = sort_tracks(tracks.clone(), col("Artist"), false, &HashMap::new());
+        assert_eq!(names(&asc), vec!["1", "2", "3"]);
+        let desc = sort_tracks(tracks, col("Artist"), true, &HashMap::new());
+        assert_eq!(names(&desc), vec!["3", "1", "2"]);
+    }
+
+    #[test]
+    fn plays_counts_missing_as_zero() {
+        let tracks = vec![track("x", "a"), track("x", "b"), track("x", "c")];
+        let plays = HashMap::from([
+            (("x".to_string(), "b".to_string()), 5),
+            (("x".to_string(), "c".to_string()), 2),
+        ]);
+
+        let desc = sort_tracks(tracks, col("Plays"), true, &plays);
+        assert_eq!(names(&desc), vec!["b", "c", "a"]);
     }
 }

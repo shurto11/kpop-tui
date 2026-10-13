@@ -85,7 +85,7 @@ MainMenu ─ Today's Drops
 ├── View
 │   ├── Log          入力順（新しい順）
 │   ├── CreditData   Artist 順 → 日付順
-│   ├── TrackData    全件 / SOTY / AOTY（再生回数付き）
+│   ├── TrackData    全件 / SOTY / AOTY、列ごとに並べ替え可（再生回数付き）
 │   ├── ArtistData   Label 順（並べ替え可）
 │   └── WriterData
 └── Quiz             10 問のイントロ当て
@@ -173,7 +173,7 @@ Artist → Track を補完から選んで答える。`p` でパス。
 | TrackData 入力 | `a` 次の BPM 候補、`r` BPM 再取得、`R` 別のアーティスト名で再取得、`d` フィールドを空にする |
 | Log | `e` アルバム名を編集、`d` 曲を削除、`r` 削除を取り消す、`l` 作家へ |
 | CreditData | `l` 作家へ |
-| TrackData | `l` 詳細、`e` 編集、`s` / `a` SOTY / AOTY で絞り込み、`S` / `A` SOTY / AOTY を切り替え |
+| TrackData | `h`/`l` 列を移動、`s` 選択中の列で並べ替え（押すたびに昇順 ⇄ 降順）、`S` / `A` SOTY / AOTY で絞り込み（並べ替えはそのまま）、`y` Album 列なら AOTY・Track 列なら SOTY を切り替え、`Enter` 詳細、`e` 編集 |
 | ArtistData | `v` ビジュアルモード（`j`/`k` で並べ替え、`d` 削除）、`e` 編集、`u` / `Ctrl+r` 元に戻す / やり直す |
 | WriterData | `l` 曲一覧、`e` 編集 |
 | WriterSearch 結果 | `l` 曲の詳細、`e` WriterData を編集 |
