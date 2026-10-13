@@ -7,6 +7,7 @@ Genius からクレジットを、songbpm.com から BPM を取り込み、Write
 - データは SQLite（`kpop.db`）1ファイル
 - Spotify のお気に入りから新しい曲をまとめて取り込む **AutoAdd**
 - spotatui 経由で曲を再生しながら閲覧、イントロ当ての **Quiz**
+- 曲ごとの**再生回数**（過去分は Spotify のデータダウンロード、以降は Last.fm）
 - 同じ DB を読み取り専用で開くブラウザ版 `kpop-web`（[web/README.md](web/README.md)）
 
 ## 必要なもの
@@ -16,6 +17,7 @@ Genius からクレジットを、songbpm.com から BPM を取り込み、Write
 | ビルド | Rust（edition 2021） |
 | AutoAdd・再生・Quiz | [spotatui](https://github.com/LargeModGames/spotatui)（認証済みであること） |
 | 終了時の SQL ダンプ push | `python3`、`git`、データ用リポジトリ `kpop-tui-data` |
+| 再生回数 | Spotify と連携した Last.fm アカウントと API キー、Spotify の拡張ストリーミング再生履歴 |
 | ブラウザ版の公開 | Tailscale |
 
 spotatui が無くても、手動入力・検索・閲覧は使える。
@@ -38,6 +40,7 @@ kpop-tui
 ~/ssd/tui/kpop-tui/
 ├── config.toml              設定（初回起動時にデフォルト値で自動生成）
 ├── kpop.db                  SQLite データベース
+├── plays.db                 再生ログ（再生回数用。バックアップしない）
 ├── backup/                  終了時に書き出される CSV
 └── scripts/backup-data.sh   終了時に実行される SQL ダンプ push
 ```
@@ -55,6 +58,10 @@ credit_key = "..."   # クレジット欄（Credit__Container 等）
 
 [database]
 path = "kpop.db"     # データディレクトリからの相対パス
+
+[lastfm]             # 無ければ Last.fm の同期をしない
+user    = "..."      # Last.fm のユーザー名
+api_key = "..."      # https://www.last.fm/api/account/create で発行
 ```
 
 `[genius]` のキーは Genius のページに付いている CSS クラス名のハッシュ部分。
@@ -78,7 +85,7 @@ MainMenu ─ Today's Drops
 ├── View
 │   ├── Log          入力順（新しい順）
 │   ├── CreditData   Artist 順 → 日付順
-│   ├── TrackData    全件 / SOTY / AOTY
+│   ├── TrackData    全件 / SOTY / AOTY（再生回数付き）
 │   ├── ArtistData   Label 順（並べ替え可）
 │   └── WriterData
 └── Quiz             10 問のイントロ当て
@@ -175,6 +182,35 @@ Artist → Track を補完から選んで答える。`p` でパス。
 
 画面下のフッターに、その画面で使えるキーが常に表示される。
 
+## 再生回数
+
+View > TrackData の Plays 列に、曲ごとの再生回数を出す。2つの元データを足し合わせる。
+
+| 期間 | 元データ | 取り込み |
+| --- | --- | --- |
+| 過去 | Spotify のデータダウンロード（拡張ストリーミング再生履歴） | `--import-spotify-history` で一度だけ |
+| それ以降 | Last.fm の scrobble | TUI 起動中に1分ごと（`--sync-lastfm` でも可） |
+
+- 両方に入っている期間は、データダウンロードの最後の再生より後の Last.fm だけを数える（二重に数えない）。
+- データダウンロードは30秒以上聴いた再生だけを数える（Spotify 自身が1再生と数える基準）。
+  30秒未満の再生も取り込み、下の名前の対応を覚えるのにだけ使う。
+- 曲との突き合わせは、データダウンロードは Spotify のトラックID、Last.fm は名前で行う。
+  Genius と Spotify で曲名の書き方が違う（`여우비 (Crush)` と `Crush` など）ので、括弧の外・中や
+  連名の1人ずつでも比べる。Remix・Japanese Ver. などの版違いは別の曲として数えない。
+  データダウンロードで ID が一致した曲の Spotify 側の名前を覚えておき、別 ID の同じ曲や Last.fm の照合にも使う
+  （連名の曲は Spotify 側で先頭の名義になる。KISS OF LIFE の `Superpower` は VALORANT 名義など）。
+
+### 準備
+
+1. Last.fm のアカウントを作り、設定 → Applications → Spotify Scrobbling で Spotify と連携する。
+   データダウンロードより先に連携しておかないと、その間の再生が抜ける。
+2. [API アカウントを作成](https://www.last.fm/api/account/create)して API キーを取り、`config.toml` の `[lastfm]` に書く。
+3. Spotify の[プライバシー設定](https://www.spotify.com/account/privacy/)で **Extended streaming history** を申請する（届くまで最大30日）。
+   届いた zip を展開し、`kpop-tui --import-spotify-history <展開したフォルダ>` で取り込む。
+
+Spotify は 2026年7月から連携の有効期限を6か月にしたので、Last.fm 側で半年ごとに再接続が要る
+（Last.fm からメールで知らせが来る）。切れている間の再生は数えられない。
+
 ## データベース
 
 | テーブル | 内容 |
@@ -189,6 +225,9 @@ Artist → Track を補完から選んで答える。`p` でパス。
 
 スキーマは起動時に自動で作成・マイグレーションされる。
 
+再生ログは別ファイルの `plays.db`（`play_log` テーブル）に置く。全期間の履歴は大きく、
+終了時の SQL ダンプに毎回載ってしまうため。データダウンロードと Last.fm から作り直せるので、バックアップはしない。
+
 ## CLI
 
 ```bash
@@ -199,6 +238,8 @@ kpop-tui --import-track   <csv>   # track_data
 kpop-tui --import-artist  <csv>   # artist_data
 kpop-tui --import-writer  <csv>   # writer_data
 kpop-tui --backfill-genius-ids    # 取り込み済みの作家に Genius artist ID を付け、同じ ID の名前を Aka に紐付ける
+kpop-tui --import-spotify-history <dir>  # Spotify のデータダウンロードを再生回数に取り込む（再実行しても重複しない）
+kpop-tui --sync-lastfm            # Last.fm の scrobble を取り込む（TUI 起動中は自動）
 ```
 
 `--backfill-genius-ids` は、ID を記録するようになる前に取り込んだ曲のためのもの。

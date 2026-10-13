@@ -1,9 +1,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use crate::db::Database;
 use crate::models::{ArtistData, BpmTrackInfo, Config, ScrapedSongInfo, TrackData, CreditData, WriterData};
+use crate::plays::{Play, PlayDb, TrackKey};
+
+/// Last.fm を見に行く間隔。scrobble は曲を聴き終わってから届くので、この程度で十分追いつく
+const LASTFM_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 操作モード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +212,14 @@ pub struct App {
     pub quiz_last_correct: bool,
     pub quiz_last_answer: String,
     pub quiz_last_actual: String,
+
+    // 再生回数（ViewTrackDataのPlays列）
+    pub plays: PlayDb,
+    pub play_counts: HashMap<TrackKey, i64>,
+    pub lastfm_rx: Option<mpsc::Receiver<Result<Vec<Play>, String>>>,
+    pub lastfm_next_sync: Option<Instant>,
+    /// 直近の同期の失敗。ViewTrackDataのタイトルに出す
+    pub lastfm_error: Option<String>,
 }
 
 /// AutoAdd: 各行のGenius確認状態
@@ -426,7 +439,7 @@ impl FormField {
 }
 
 impl App {
-    pub fn new(db: Database, config: Config) -> Self {
+    pub fn new(db: Database, plays: PlayDb, config: Config) -> Self {
         let menu_items = vec![
             MenuItem {
                 label: "Input".to_string(),
@@ -539,9 +552,55 @@ impl App {
             quiz_last_correct: false,
             quiz_last_answer: String::new(),
             quiz_last_actual: String::new(),
+            plays,
+            play_counts: HashMap::new(),
+            lastfm_rx: None,
+            lastfm_next_sync: None,
+            lastfm_error: None,
         };
         app.load_screen_data();
         app
+    }
+
+    /// ViewTrackDataのPlays列を数え直す
+    pub fn refresh_play_counts(&mut self) {
+        let tracks = self.db.get_all_track_data().unwrap_or_default();
+        self.play_counts = self.plays.play_counts(&tracks).unwrap_or_default();
+    }
+
+    /// Last.fmの同期をバックグラウンドで始める。
+    /// 設定が無い・同期中・前回から間がないときは何もしない
+    pub fn maybe_start_lastfm_sync(&mut self) {
+        let Some(lastfm) = self.config.lastfm().cloned() else {
+            return;
+        };
+        if self.lastfm_rx.is_some() || self.lastfm_next_sync.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        self.lastfm_next_sync = Some(Instant::now() + LASTFM_SYNC_INTERVAL);
+
+        let from = self.plays.last_lastfm_at().ok().flatten();
+        let (tx, rx) = mpsc::channel();
+        self.lastfm_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::plays::fetch_lastfm(&lastfm, from).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Last.fmの同期結果を取り込む
+    pub fn finish_lastfm_sync(&mut self, result: Result<Vec<Play>, String>) {
+        let inserted = result.and_then(|plays| self.plays.insert_lastfm(&plays).map_err(|e| e.to_string()));
+        match inserted {
+            Ok(n) => {
+                self.lastfm_error = None;
+                // 他の画面にいる間は数え直さない（ViewTrackDataに入るときに数える）
+                if n > 0 && self.screen == Screen::ViewTrackData {
+                    self.refresh_play_counts();
+                }
+            }
+            Err(e) => self.lastfm_error = Some(e),
+        }
     }
 
     /// 画面を遷移
@@ -1004,6 +1063,7 @@ impl App {
             }
             Screen::ViewTrackData => {
                 self.tracks = self.db.get_all_track_data().unwrap_or_default();
+                self.refresh_play_counts();
             }
             Screen::ViewArtistData => {
                 self.artists = self.db.get_artists_sorted().unwrap_or_default();

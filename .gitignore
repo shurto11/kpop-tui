@@ -1,5 +1,6 @@
 target/
 kpop.db
+plays.db
 kpop4
 kpop-tui
 config.toml

@@ -1,7 +1,7 @@
-use kpop_tui::{backfill, db, models, tui};
+use kpop_tui::{backfill, db, models, plays, tui};
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,6 +14,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use db::Database;
 use models::Config;
+use plays::PlayDb;
 use tui::{app::App, input::{finish_auto_add_bpm, finish_auto_add_scan, handle_key, process_auto_add_msg, process_bpm_result, process_scrape_result, tick_bpm_pending, quiz_auto_play}, ui::draw};
 
 fn main() -> Result<()> {
@@ -24,6 +25,7 @@ fn main() -> Result<()> {
     // データベースのパス
     let db_path = get_data_dir().join(&config.database.path);
     let db = Database::open(&db_path)?;
+    let play_db = PlayDb::open(get_data_dir().join("plays.db"))?;
 
     // CSVインポートモード
     let args: Vec<String> = std::env::args().collect();
@@ -54,6 +56,34 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Spotify のデータダウンロード（拡張ストリーミング再生履歴）を再生回数に取り込む
+    if args.len() >= 3 && args[1] == "--import-spotify-history" {
+        let history = plays::read_spotify_history(Path::new(&args[2]))?;
+        let inserted = play_db.insert_spotify(&history.plays)?;
+        println!(
+            "Read {} rows from {} files: {} song plays ({} of 30s+ are counted), {} new.",
+            history.rows,
+            history.files,
+            history.plays.len(),
+            history.plays.iter().filter(|p| p.is_counted()).count(),
+            inserted
+        );
+        print_play_summary(&db, &play_db)?;
+        return Ok(());
+    }
+
+    // Last.fm の scrobble を取り込む（TUI 起動中は自動で同期される）
+    if args.len() >= 2 && args[1] == "--sync-lastfm" {
+        let lastfm = config
+            .lastfm()
+            .ok_or_else(|| anyhow::anyhow!("[lastfm] user and api_key are not set in config.toml"))?;
+        let fetched = plays::fetch_lastfm(lastfm, play_db.last_lastfm_at()?)?;
+        let inserted = play_db.insert_lastfm(&fetched)?;
+        println!("Fetched {} scrobbles, {} new.", fetched.len(), inserted);
+        print_play_summary(&db, &play_db)?;
+        return Ok(());
+    }
+
     // CSVエクスポートモード
     if args.len() >= 2 && args[1] == "--export" {
         let dir = if args.len() >= 3 { &args[2] } else { "backup" };
@@ -77,7 +107,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // アプリケーション起動
-    let mut app = App::new(db, config);
+    let mut app = App::new(db, play_db, config);
     let result = run_app(&mut terminal, &mut app);
 
     // ターミナル復元
@@ -249,6 +279,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             }
         }
 
+        // Last.fm の同期（間隔が空いていれば開始し、終わっていれば取り込む）
+        app.maybe_start_lastfm_sync();
+        if let Some(rx) = app.lastfm_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => app.finish_lastfm_sync(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => app.lastfm_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.finish_lastfm_sync(Err("Last.fm sync thread disconnected".to_string()));
+                }
+            }
+        }
+
         // イベント待機（100ms タイムアウト）
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -276,6 +318,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         }
     }
 
+    Ok(())
+}
+
+/// 取り込み後に、再生回数が付いた曲数と上位を出す
+fn print_play_summary(db: &Database, play_db: &PlayDb) -> Result<()> {
+    let counts = play_db.play_counts(&db.get_all_track_data()?)?;
+    let total: i64 = counts.values().sum();
+    println!("{} plays on {} tracks in TrackData.", total, counts.len());
+
+    let mut top: Vec<_> = counts.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for ((artist, track), n) in top.iter().take(10) {
+        println!("  {:>5}  {} - {}", n, artist, track);
+    }
     Ok(())
 }
 

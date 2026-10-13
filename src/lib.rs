@@ -4,6 +4,7 @@
 pub mod backfill;
 pub mod db;
 pub mod models;
+pub mod plays;
 pub mod scraper;
 pub mod spotify;
 pub mod tui;

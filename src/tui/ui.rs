@@ -1724,7 +1724,7 @@ fn draw_writer_table(frame: &mut Frame, app: &App, area: Rect) {
 
 /// TrackDataテーブル
 fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Rel"])
+    let header = Row::new(vec!["Artist", "Label", "Date", "Album", "Track", "Genre", "Dur", "BPM", "Rel", "Plays"])
         .style(Style::default().add_modifier(Modifier::BOLD))
         .height(1);
 
@@ -1762,6 +1762,11 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
             let genre_display = track.genres.as_ref()
                 .map(|g| crate::models::genres_display(g))
                 .unwrap_or_default();
+            let plays = app
+                .play_counts
+                .get(&(track.artist.clone(), track.track.clone()))
+                .map(|n| n.to_string())
+                .unwrap_or_default();
             Row::new(vec![
                 Cell::from(track.artist.clone()),
                 Cell::from(track.label.clone().unwrap_or_default()),
@@ -1772,6 +1777,7 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(duration),
                 Cell::from(track.bpm.clone().unwrap_or_default()),
                 Cell::from(release.to_string()),
+                Cell::from(plays),
             ])
             .style(style)
         })
@@ -1783,24 +1789,30 @@ fn draw_track_table(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Percentage(14), // Artist
             Constraint::Percentage(8),  // Label
             Constraint::Percentage(9),  // Date
-            Constraint::Percentage(16), // Album
-            Constraint::Percentage(20), // Track
-            Constraint::Percentage(13), // Genre
+            Constraint::Percentage(15), // Album
+            Constraint::Percentage(19), // Track
+            Constraint::Percentage(12), // Genre
             Constraint::Percentage(6),  // Duration
-            Constraint::Percentage(6),  // BPM
-            Constraint::Percentage(8),  // Release
+            Constraint::Percentage(5),  // BPM
+            Constraint::Percentage(6),  // Release
+            Constraint::Percentage(6),  // Plays
         ],
     )
     .header(header)
-    .block(
-        Block::default()
+    .block({
+        let block = Block::default()
             .borders(Borders::ALL)
             .title(match app.track_filter {
                 crate::tui::app::TrackFilter::Soty => format!("TrackData [SOTY] ({})", app.tracks.len()),
                 crate::tui::app::TrackFilter::Aoty => format!("TrackData [AOTY] ({})", app.tracks.len()),
                 crate::tui::app::TrackFilter::All => format!("TrackData ({})", app.tracks.len()),
-            }),
-    );
+            });
+        // Last.fm の同期に失敗しているときだけ出す
+        match &app.lastfm_error {
+            Some(e) => block.title(Line::from(format!(" Last.fm: {} ", e)).style(Style::default().fg(Color::Red))),
+            None => block,
+        }
+    });
 
     frame.render_widget(table, area);
 }

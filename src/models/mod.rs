@@ -208,6 +208,17 @@ pub struct BpmTrackInfo {
 pub struct Config {
     pub genius: GeniusConfig,
     pub database: DatabaseConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lastfm: Option<LastfmConfig>,
+}
+
+impl Config {
+    /// Last.fm の設定。user と api_key が揃っているときだけ返す
+    pub fn lastfm(&self) -> Option<&LastfmConfig> {
+        self.lastfm
+            .as_ref()
+            .filter(|c| !c.user.is_empty() && !c.api_key.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +236,13 @@ pub struct DatabaseConfig {
     pub path: String,
 }
 
+/// Last.fm（再生回数の同期）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastfmConfig {
+    pub user: String,
+    pub api_key: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -237,6 +255,7 @@ impl Default for Config {
             database: DatabaseConfig {
                 path: "kpop.db".to_string(),
             },
+            lastfm: None,
         }
     }
 }
