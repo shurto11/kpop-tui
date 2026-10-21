@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -220,6 +220,8 @@ pub struct App {
     // 再生回数（ViewTrackDataのPlays列）
     pub plays: PlayDb,
     pub play_counts: HashMap<TrackKey, i64>,
+    /// SearchTrackのPlays枠: 表示曲の月ごとの再生回数（"YYYY-MM" → 回数）
+    pub track_monthly_plays: BTreeMap<String, i64>,
     pub lastfm_rx: Option<mpsc::Receiver<Result<Vec<Play>, String>>>,
     pub lastfm_next_sync: Option<Instant>,
     /// 直近の同期の失敗。ViewTrackDataのタイトルに出す
@@ -581,6 +583,7 @@ impl App {
             quiz_last_actual: String::new(),
             plays,
             play_counts: HashMap::new(),
+            track_monthly_plays: BTreeMap::new(),
             lastfm_rx: None,
             lastfm_next_sync: None,
             lastfm_error: None,
@@ -609,6 +612,16 @@ impl App {
         self.play_counts = self.plays.play_counts(&tracks).unwrap_or_default();
     }
 
+    /// SearchTrackのPlays枠を数え直す
+    pub fn refresh_track_plays(&mut self) {
+        let Screen::SearchTrackResult { artist, track } = &self.screen else {
+            return;
+        };
+        let tracks = self.db.get_all_track_data().unwrap_or_default();
+        let key = (artist.clone(), track.clone());
+        self.track_monthly_plays = self.plays.monthly_plays(&tracks, &key).unwrap_or_default();
+    }
+
     /// Last.fmの同期をバックグラウンドで始める。
     /// 設定が無い・同期中・前回から間がないときは何もしない
     pub fn maybe_start_lastfm_sync(&mut self) {
@@ -635,9 +648,13 @@ impl App {
         match inserted {
             Ok(n) => {
                 self.lastfm_error = None;
-                // 他の画面にいる間は数え直さない（ViewTrackDataに入るときに数える）
-                if n > 0 && self.screen == Screen::ViewTrackData {
-                    self.refresh_play_counts();
+                // 他の画面にいる間は数え直さない（ViewTrackData・SearchTrackに入るときに数える）
+                if n > 0 {
+                    match self.screen {
+                        Screen::ViewTrackData => self.refresh_play_counts(),
+                        Screen::SearchTrackResult { .. } => self.refresh_track_plays(),
+                        _ => {}
+                    }
                 }
             }
             Err(e) => self.lastfm_error = Some(e),
@@ -1290,6 +1307,8 @@ impl App {
                         }
                     }
                 }
+
+                self.refresh_track_plays();
             }
         }
     }

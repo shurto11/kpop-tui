@@ -81,7 +81,7 @@ MainMenu ─ Today's Drops
 │   └── WriterAka    同一人物の別名を紐付け
 ├── Search
 │   ├── WriterSearch 作家ごとの統計と曲リスト
-│   └── TrackSearch  曲ごとのクレジットと TrackData
+│   └── TrackSearch  曲ごとのクレジットと TrackData（年・月ごとの再生回数付き）
 ├── View
 │   ├── Log          入力順（新しい順）
 │   ├── CreditData   Artist 順 → 日付順
@@ -132,6 +132,7 @@ Spotify のジャケット（ASCII アート）を表示する。該当曲がな
 - **WriterSearch** — Role 別の曲数と作家内での順位、SOTY / AOTY の曲数、年別の曲数、
   WriterData、関わった曲のリストを表示する。
 - **TrackSearch** — Artist → Track を補完付きで選び、Role ごとの作家とその曲数、TrackData を表示する。
+  MainMenu と同じ Around-The-Day Drops と、その曲の再生回数（Plays）も並べる。
 
 ### Quiz
 
@@ -184,7 +185,10 @@ Artist → Track を補完から選んで答える。`p` でパス。
 
 ## 再生回数
 
-View > TrackData の Plays 列に、曲ごとの再生回数を出す。2つの元データを足し合わせる。
+View > TrackData の Plays 列に、曲ごとの再生回数を出す。
+Search > TrackSearch の Plays 枠には、その曲の年ごとの再生回数を横棒で、月ごとの再生回数を縦棒で出す
+（最初に再生した月から今月まで。枠に入りきらない古い年・月は切る）。
+2つの元データを足し合わせる。
 
 | 期間 | 元データ | 取り込み |
 | --- | --- | --- |

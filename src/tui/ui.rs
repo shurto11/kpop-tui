@@ -2098,13 +2098,14 @@ fn draw_song_result(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    // 横分割: 左=Album, 中=TrackData, 右=Around-The-Day Drops
+    // 横分割: Album | TrackData | Around-The-Day Drops | Plays
     let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(22), // Album: 20文字 + ボーダー2
             Constraint::Fill(1),    // TrackData (均等)
             Constraint::Fill(1),    // Around-The-Day Drops (均等)
+            Constraint::Fill(1),    // Plays (均等)
         ])
         .split(chunks[0]);
 
@@ -2144,6 +2145,9 @@ fn draw_song_result(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Around-The-Day Drops
     draw_around_day(frame, app, top_chunks[2], "Around-The-Day Drops");
+
+    // Plays
+    draw_plays(frame, app, top_chunks[3]);
 
     // Credits テーブル（実際の領域に合わせてvisible_rowsを再計算）
     let credit_area = chunks[1];
@@ -2228,6 +2232,158 @@ fn draw_around_day(frame: &mut Frame, app: &App, area: Rect, title: &str) {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
     frame.render_widget(block, area);
+}
+
+/// Plays描画: 上に年ごとの横棒、下に月ごとの縦棒（右端が今月。入りきらない古い月は切る）
+fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
+    let total: i64 = app.track_monthly_plays.values().sum();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if total > 0 { format!("Plays ({})", total) } else { "Plays".to_string() })
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let today = Local::now().date_naive();
+    let series = month_series(&app.track_monthly_plays, (today.year(), today.month()));
+    if series.is_empty() {
+        let none = Paragraph::new(Span::styled("(none)", Style::default().fg(Color::DarkGray)));
+        frame.render_widget(none, inner);
+        return;
+    }
+
+    // 年ごとの合計。月グラフに区切り1行 + 縦棒3行 + 目盛り1行を残し、入りきらない古い年は切る
+    let mut years: Vec<(i32, i64)> = Vec::new();
+    for &((y, _), n) in &series {
+        match years.last_mut() {
+            Some((last, sum)) if *last == y => *sum += n,
+            _ => years.push((y, n)),
+        }
+    }
+    let year_rows = years.len().min(inner.height.saturating_sub(5) as usize);
+    let years = &years[years.len() - year_rows..];
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(year_rows as u16), // 年ごと
+            Constraint::Length(1),                // 区切り（月グラフの最大値）
+            Constraint::Min(0),                   // 月ごと
+            Constraint::Length(1),                // 目盛り（年）
+        ])
+        .split(inner);
+
+    let max_year = years.iter().map(|&(_, n)| n).max().unwrap_or(0);
+    let count_w = max_year.to_string().len();
+    let bar_w = (inner.width as usize).saturating_sub(5 + 1 + count_w); // "YYYY " + 棒 + " " + 回数
+    let year_lines: Vec<Line> = years
+        .iter()
+        .map(|&(y, n)| {
+            Line::from(vec![
+                Span::styled(format!("{} ", y), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<bar_w$}", hbar(n, max_year, bar_w)), Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {:>count_w$}", n)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(year_lines), rows[0]);
+
+    let width = rows[2].width as usize;
+    let (shown, bar_width, bar_gap) = month_layout(series.len(), width);
+    let months = &series[series.len() - shown..];
+    let max_month = months.iter().map(|&(_, n)| n).max().unwrap_or(0);
+    let scale = Paragraph::new(Span::styled(format!("max {}", max_month), Style::default().fg(Color::DarkGray)))
+        .alignment(ratatui::layout::Alignment::Right);
+    frame.render_widget(scale, rows[1]);
+
+    let bars: Vec<Bar> = months
+        .iter()
+        .map(|&(_, n)| {
+            Bar::default()
+                .value(n as u64)
+                .text_value(String::new())
+                .style(Style::default().fg(Color::Cyan))
+        })
+        .collect();
+    let month_chart = BarChart::default()
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(bar_width as u16)
+        .bar_gap(bar_gap as u16);
+    frame.render_widget(month_chart, rows[2]);
+
+    let axis = year_axis(months, bar_width + bar_gap, width);
+    frame.render_widget(Paragraph::new(Span::styled(axis, Style::default().fg(Color::DarkGray))), rows[3]);
+}
+
+/// 最初に再生した月から end の月までの、月ごとの再生回数（再生の無い月は0）
+fn month_series(months: &std::collections::BTreeMap<String, i64>, end: (i32, u32)) -> Vec<((i32, u32), i64)> {
+    let counts: std::collections::HashMap<(i32, u32), i64> = months
+        .iter()
+        .filter_map(|(ym, &n)| {
+            let (y, m) = ym.split_once('-')?;
+            Some(((y.parse().ok()?, m.parse().ok()?), n))
+        })
+        .collect();
+    let (Some(&first), Some(&last)) = (counts.keys().min(), counts.keys().max()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut ym = first;
+    while ym <= end.max(last) {
+        out.push((ym, counts.get(&ym).copied().unwrap_or(0)));
+        ym = if ym.1 == 12 { (ym.0 + 1, 1) } else { (ym.0, ym.1 + 1) };
+    }
+    out
+}
+
+/// 月グラフに出す月数と、棒の幅・間隔。
+/// 全部入るなら間を空けて太くし（最大3）、入らなければ1月1文字にして古い月を切る
+fn month_layout(months: usize, width: usize) -> (usize, usize, usize) {
+    let shown = months.min(width).max(1);
+    let gap = if 2 * shown <= width + 1 { 1 } else { 0 };
+    let bar_width = ((width + gap) / shown).saturating_sub(gap).clamp(1, 3);
+    (shown, bar_width, gap)
+}
+
+/// 月グラフの目盛り。各年の1月の位置に年を書く。
+/// 左端が1月でないときは、次の年と重ならなければ左端にもその年を書く
+fn year_axis(months: &[((i32, u32), i64)], step: usize, width: usize) -> String {
+    let mut labels: Vec<(usize, String)> = months
+        .iter()
+        .enumerate()
+        .filter(|(_, ((_, m), _))| *m == 1)
+        .map(|(i, ((y, _), _))| (i * step, y.to_string()))
+        .collect();
+    if let Some(&((y, m), _)) = months.first() {
+        let next_x = labels.first().map_or(width, |(x, _)| *x);
+        if m != 1 && next_x > 4 {
+            labels.insert(0, (0, y.to_string()));
+        }
+    }
+
+    let mut axis = String::new();
+    for (x, label) in labels {
+        if (axis.is_empty() || x > axis.len()) && x + label.len() <= width {
+            axis.push_str(&" ".repeat(x - axis.len()));
+            axis.push_str(&label);
+        }
+    }
+    axis
+}
+
+/// 横棒（1/8刻み）。max のときに width 文字。0でなければ最低でも1/8は出す
+fn hbar(value: i64, max: i64, width: usize) -> String {
+    if value <= 0 || max <= 0 || width == 0 {
+        return String::new();
+    }
+    let eighths = ((value * width as i64 * 8) / max).max(1) as usize;
+    let (full, rest) = (eighths / 8, eighths % 8);
+    let mut bar = "█".repeat(full);
+    if rest > 0 {
+        bar.push(['▏', '▎', '▍', '▌', '▋', '▊', '▉'][rest - 1]);
+    }
+    bar
 }
 
 /// Art枠のプレースホルダー（Loading or 空）
@@ -2446,5 +2602,54 @@ fn should_show_suggestions(app: &App) -> bool {
         Screen::InputWriterData => app.form_index == 0,
         // その他は常に表示
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod plays_chart_tests {
+    use super::*;
+
+    #[test]
+    fn month_series_fills_gaps_up_to_end() {
+        let months = std::collections::BTreeMap::from([
+            ("2025-11".to_string(), 3),
+            ("2026-02".to_string(), 1),
+        ]);
+        assert_eq!(
+            month_series(&months, (2026, 3)),
+            vec![((2025, 11), 3), ((2025, 12), 0), ((2026, 1), 0), ((2026, 2), 1), ((2026, 3), 0)]
+        );
+        assert!(month_series(&std::collections::BTreeMap::new(), (2026, 3)).is_empty());
+    }
+
+    #[test]
+    fn month_layout_widens_bars_when_they_fit() {
+        assert_eq!(month_layout(1, 47), (1, 3, 1));
+        assert_eq!(month_layout(12, 47), (12, 3, 1));
+        assert_eq!(month_layout(16, 47), (16, 2, 1));
+        assert_eq!(month_layout(30, 47), (30, 1, 0));
+        // 入らなければ新しい月から width 個
+        assert_eq!(month_layout(56, 47), (47, 1, 0));
+    }
+
+    #[test]
+    fn year_axis_marks_januaries() {
+        let months: Vec<((i32, u32), i64)> =
+            (6..=12).map(|m| ((2024, m), 0)).chain((1..=12).map(|m| ((2025, m), 0))).collect();
+        // 1月1文字: 2024年6月から始まり、2025年1月は7文字目
+        assert_eq!(year_axis(&months, 1, 30), "2024   2025");
+        // 左端の年が次の年と重なるなら書かない
+        assert_eq!(year_axis(&months[4..], 1, 30), "   2025");
+        // 右端からはみ出す年は書かない
+        assert_eq!(year_axis(&months, 1, 10), "2024");
+    }
+
+    #[test]
+    fn hbar_uses_eighths() {
+        assert_eq!(hbar(10, 10, 4), "████");
+        assert_eq!(hbar(5, 10, 3), "█▌");
+        // 0でなければ最低1/8
+        assert_eq!(hbar(1, 1000, 4), "▏");
+        assert_eq!(hbar(0, 10, 4), "");
     }
 }

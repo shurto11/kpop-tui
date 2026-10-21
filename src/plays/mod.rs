@@ -1,4 +1,4 @@
-//! 曲ごとの再生回数（ViewTrackData の Plays 列）。
+//! 曲ごとの再生回数（ViewTrackData の Plays 列、SearchTrack の Plays 枠）。
 //!
 //! 過去分は Spotify のデータダウンロード（拡張ストリーミング再生履歴）、それ以降は Last.fm の
 //! scrobble から数える。両方に同じ再生が入る期間があるので、データダウンロードの最後の再生より
@@ -8,7 +8,7 @@
 //! （kpop-tui-data への push）に毎回載ってしまうため。データダウンロードと Last.fm から
 //! 作り直せる派生データなので、バックアップはしない。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -121,6 +121,38 @@ impl PlayDb {
     /// TrackData の (artist, track) ごとの再生回数。再生の無い曲は入らない
     pub fn play_counts(&self, tracks: &[TrackData]) -> Result<HashMap<TrackKey, i64>> {
         Ok(Matcher::new(tracks).count(&self.groups()?))
+    }
+
+    /// 1曲の月ごとの再生回数（"YYYY-MM" → 回数。月はローカル時刻で区切る）。再生の無い月は入らない。
+    /// 突き合わせは play_counts と同じ（tracks は TrackData の全曲）
+    pub fn monthly_plays(&self, tracks: &[TrackData], key: &TrackKey) -> Result<BTreeMap<String, i64>> {
+        let groups = self.groups()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT strftime('%Y-%m', played_at, 'unixepoch', 'localtime'), COUNT(*)
+             FROM play_log
+             WHERE artist = ?4 AND track = ?5 AND spotify_id IS ?6
+               AND (ms_played IS NULL OR ms_played >= ?3)
+               AND (source = ?1
+                    OR (source = ?2 AND played_at > COALESCE(
+                           (SELECT MAX(played_at) FROM play_log WHERE source = ?1), -1)))
+             GROUP BY 1",
+        )?;
+
+        let mut months = BTreeMap::new();
+        for (g, keys) in groups.iter().zip(Matcher::new(tracks).resolve(&groups)) {
+            if !keys.contains(&key) {
+                continue;
+            }
+            let rows = stmt.query_map(
+                params![SOURCE_SPOTIFY, SOURCE_LASTFM, MIN_MS_PLAYED, g.artist, g.track, g.spotify_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            for row in rows {
+                let (month, n) = row?;
+                *months.entry(month).or_default() += n;
+            }
+        }
+        Ok(months)
     }
 
     /// 再生を (artist, track, spotify_id) ごとにまとめる。count は数える再生（Play::is_counted）の数。
@@ -267,6 +299,17 @@ impl Matcher {
     }
 
     fn count(&self, groups: &[PlayGroup]) -> HashMap<TrackKey, i64> {
+        let mut counts: HashMap<TrackKey, i64> = HashMap::new();
+        for (g, keys) in groups.iter().zip(self.resolve(groups)) {
+            for key in keys {
+                *counts.entry(key.clone()).or_default() += g.count;
+            }
+        }
+        counts
+    }
+
+    /// まとまりごとに、どの TrackData の再生か。数える再生の無いまとまり（count == 0）は空
+    fn resolve(&self, groups: &[PlayGroup]) -> Vec<Vec<&TrackKey>> {
         // IDで決まった再生から、Spotify 側の名前 → TrackData の対応を覚える。
         // ソロ曲がグループ名義で出ている（LEESEO "Super ICY" → IVE "Super ICY (LEESEO Solo)"）など
         // 名前では合わない曲も、Last.fm（名前しか無い）や別IDの同じ曲で数えられるようにするため。
@@ -280,23 +323,21 @@ impl Matcher {
             }
         }
 
-        let mut counts: HashMap<TrackKey, i64> = HashMap::new();
-        for (g, id_keys) in groups.iter().zip(&by_id) {
-            if g.count == 0 {
-                continue;
-            }
-            let keys: Vec<&TrackKey> = if !id_keys.is_empty() {
-                id_keys.clone()
-            } else if let Some(keys) = learned.get(&(squash(&g.artist), squash(&g.track))) {
-                keys.to_vec()
-            } else {
-                self.lookup_by_name(&g.artist, &g.track)
-            };
-            for key in keys {
-                *counts.entry(key.clone()).or_default() += g.count;
-            }
-        }
-        counts
+        groups
+            .iter()
+            .zip(&by_id)
+            .map(|(g, id_keys)| {
+                if g.count == 0 {
+                    Vec::new()
+                } else if !id_keys.is_empty() {
+                    id_keys.clone()
+                } else if let Some(keys) = learned.get(&(squash(&g.artist), squash(&g.track))) {
+                    keys.to_vec()
+                } else {
+                    self.lookup_by_name(&g.artist, &g.track)
+                }
+            })
+            .collect()
     }
 
     /// IDで引く。同じ URL が複数の行に入っているときは、名前も合う行に絞る
@@ -627,6 +668,35 @@ mod tests {
             db.play_counts(&tracks).unwrap(),
             HashMap::from([(key("KISS OF LIFE", "Superpower"), 2)])
         );
+    }
+
+    #[test]
+    fn monthly_plays_of_one_track() {
+        let db = PlayDb::open(":memory:").unwrap();
+        let tracks = [
+            track("LEESEO", "Super ICY", Some("https://open.spotify.com/track/ICY")),
+            track("NMIXX", "LOUD", Some("https://open.spotify.com/track/LOUD")),
+        ];
+        // 月の真ん中の正午（UTC）。どのタイムゾーンでも同じ月になる
+        let at = |y, m| {
+            chrono::NaiveDate::from_ymd_opt(y, m, 15).unwrap().and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp()
+        };
+        db.insert_spotify(&[
+            listen(at(2025, 3), "IVE", "Super ICY (LEESEO Solo)", "ICY", 200_000),
+            listen(at(2025, 3) + 600, "IVE", "Super ICY (LEESEO Solo)", "ICY", 200_000),
+            // 30秒未満は数えない
+            listen(at(2025, 4), "IVE", "Super ICY (LEESEO Solo)", "ICY", 5_000),
+            listen(at(2026, 1), "NMIXX", "LOUD", "LOUD", 200_000),
+        ])
+        .unwrap();
+        // Last.fm は名前しか無いが、データダウンロードで覚えた名前で数える
+        db.insert_lastfm(&[scrobble(at(2026, 2), "IVE", "Super ICY (LEESEO Solo)")]).unwrap();
+
+        assert_eq!(
+            db.monthly_plays(&tracks, &key("LEESEO", "Super ICY")).unwrap(),
+            BTreeMap::from([("2025-03".to_string(), 2), ("2026-02".to_string(), 1)])
+        );
+        assert!(db.monthly_plays(&tracks, &key("NMIXX", "Other")).unwrap().is_empty());
     }
 
     #[test]
