@@ -2252,7 +2252,7 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // 年ごとの合計。月グラフに区切り1行 + 縦棒3行 + 目盛り1行を残し、入りきらない古い年は切る
+    // 年ごとの合計。月グラフに縦棒3行 + 回数1行 + 目盛り1行を残し、入りきらない古い年は切る
     let mut years: Vec<(i32, i64)> = Vec::new();
     for &((y, _), n) in &series {
         match years.last_mut() {
@@ -2260,29 +2260,35 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
             _ => years.push((y, n)),
         }
     }
-    let year_rows = years.len().min(inner.height.saturating_sub(5) as usize);
+    let height = inner.height as usize;
+    let year_rows = years.len().min(height.saturating_sub(5));
     let years = &years[years.len() - year_rows..];
+    // 縦棒が4行以上残るときだけ、年ごとと月ごとの間を1行空ける
+    let sep = u16::from(height >= year_rows + 1 + 4 + 2);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(year_rows as u16), // 年ごと
-            Constraint::Length(1),                // 区切り（月グラフの最大値）
+            Constraint::Length(sep),              // 区切り
             Constraint::Min(0),                   // 月ごと
+            Constraint::Length(1),                // 多い月の回数
             Constraint::Length(1),                // 目盛り（年）
         ])
         .split(inner);
 
+    // 回数は Writer の Yearly と同じ黄色の太字
+    let value_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let max_year = years.iter().map(|&(_, n)| n).max().unwrap_or(0);
     let count_w = max_year.to_string().len();
-    let bar_w = (inner.width as usize).saturating_sub(5 + 1 + count_w); // "YYYY " + 棒 + " " + 回数
+    let bar_w = (inner.width as usize).saturating_sub(3 + 1 + count_w); // "YY " + 棒 + " " + 回数
     let year_lines: Vec<Line> = years
         .iter()
         .map(|&(y, n)| {
             Line::from(vec![
-                Span::styled(format!("{} ", y), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} ", short_year(y)), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:<bar_w$}", hbar(n, max_year, bar_w)), Style::default().fg(Color::Cyan)),
-                Span::raw(format!(" {:>count_w$}", n)),
+                Span::styled(format!(" {:>count_w$}", n), value_style),
             ])
         })
         .collect();
@@ -2291,10 +2297,6 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
     let width = rows[2].width as usize;
     let (shown, bar_width, bar_gap) = month_layout(series.len(), width);
     let months = &series[series.len() - shown..];
-    let max_month = months.iter().map(|&(_, n)| n).max().unwrap_or(0);
-    let scale = Paragraph::new(Span::styled(format!("max {}", max_month), Style::default().fg(Color::DarkGray)))
-        .alignment(ratatui::layout::Alignment::Right);
-    frame.render_widget(scale, rows[1]);
 
     let bars: Vec<Bar> = months
         .iter()
@@ -2311,8 +2313,16 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
         .bar_gap(bar_gap as u16);
     frame.render_widget(month_chart, rows[2]);
 
+    let counts = top_month_counts(months, bar_width + bar_gap, bar_width, width);
+    frame.render_widget(Paragraph::new(Span::styled(counts, value_style)), rows[3]);
+
     let axis = year_axis(months, bar_width + bar_gap, width);
-    frame.render_widget(Paragraph::new(Span::styled(axis, Style::default().fg(Color::DarkGray))), rows[3]);
+    frame.render_widget(Paragraph::new(Span::styled(axis, Style::default().fg(Color::DarkGray))), rows[4]);
+}
+
+/// 年の下2桁（2024 → "24"）
+fn short_year(year: i32) -> String {
+    format!("{:02}", year.rem_euclid(100))
 }
 
 /// 最初に再生した月から end の月までの、月ごとの再生回数（再生の無い月は0）
@@ -2346,6 +2356,31 @@ fn month_layout(months: usize, width: usize) -> (usize, usize, usize) {
     (shown, bar_width, gap)
 }
 
+/// 月グラフの棒の下に書く回数。多い月から3つまで、棒の真ん中の下に書く。
+/// 書いた回数と重なる月（隣の月など）は飛ばして、次に多い月に書く
+fn top_month_counts(months: &[((i32, u32), i64)], step: usize, bar_width: usize, width: usize) -> String {
+    let mut order: Vec<usize> = (0..months.len()).filter(|&i| months[i].1 > 0).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(months[i].1));
+
+    let mut labels: Vec<(usize, String)> = Vec::new();
+    for i in order {
+        if labels.len() == 3 {
+            break;
+        }
+        let text = months[i].1.to_string();
+        let len = text.len();
+        // 枠からはみ出すなら内側へずらす
+        let x = ((i * step) as isize + (bar_width as isize - len as isize) / 2)
+            .clamp(0, width.saturating_sub(len) as isize) as usize;
+        // 隣の回数とは1文字空ける
+        if labels.iter().all(|(lx, l)| x + len < *lx || lx + l.len() < x) {
+            labels.push((x, text));
+        }
+    }
+    labels.sort();
+    place_labels(labels)
+}
+
 /// 月グラフの目盛り。各年の1月の位置に年を書く。
 /// 左端が1月でないときは、次の年と重ならなければ左端にもその年を書く
 fn year_axis(months: &[((i32, u32), i64)], step: usize, width: usize) -> String {
@@ -2353,23 +2388,34 @@ fn year_axis(months: &[((i32, u32), i64)], step: usize, width: usize) -> String 
         .iter()
         .enumerate()
         .filter(|(_, ((_, m), _))| *m == 1)
-        .map(|(i, ((y, _), _))| (i * step, y.to_string()))
+        .map(|(i, ((y, _), _))| (i * step, short_year(*y)))
         .collect();
     if let Some(&((y, m), _)) = months.first() {
+        let label = short_year(y);
         let next_x = labels.first().map_or(width, |(x, _)| *x);
-        if m != 1 && next_x > 4 {
-            labels.insert(0, (0, y.to_string()));
+        if m != 1 && next_x > label.len() {
+            labels.insert(0, (0, label));
         }
     }
 
-    let mut axis = String::new();
+    let mut kept: Vec<(usize, String)> = Vec::new();
     for (x, label) in labels {
-        if (axis.is_empty() || x > axis.len()) && x + label.len() <= width {
-            axis.push_str(&" ".repeat(x - axis.len()));
-            axis.push_str(&label);
+        let after_last = kept.last().is_none_or(|(lx, l)| x > lx + l.len());
+        if after_last && x + label.len() <= width {
+            kept.push((x, label));
         }
     }
-    axis
+    place_labels(kept)
+}
+
+/// (位置, 文字列) を1行に並べる。位置の順で、重ならないこと
+fn place_labels(labels: Vec<(usize, String)>) -> String {
+    let mut line = String::new();
+    for (x, label) in labels {
+        line.push_str(&" ".repeat(x - line.len()));
+        line.push_str(&label);
+    }
+    line
 }
 
 /// 横棒（1/8刻み）。max のときに width 文字。0でなければ最低でも1/8は出す
@@ -2637,11 +2683,26 @@ mod plays_chart_tests {
         let months: Vec<((i32, u32), i64)> =
             (6..=12).map(|m| ((2024, m), 0)).chain((1..=12).map(|m| ((2025, m), 0))).collect();
         // 1月1文字: 2024年6月から始まり、2025年1月は7文字目
-        assert_eq!(year_axis(&months, 1, 30), "2024   2025");
+        assert_eq!(year_axis(&months, 1, 30), "24     25");
         // 左端の年が次の年と重なるなら書かない
-        assert_eq!(year_axis(&months[4..], 1, 30), "   2025");
+        assert_eq!(year_axis(&months[4..], 1, 30), "24 25");
+        assert_eq!(year_axis(&months[5..], 1, 30), "  25");
         // 右端からはみ出す年は書かない
-        assert_eq!(year_axis(&months, 1, 10), "2024");
+        assert_eq!(year_axis(&months, 1, 8), "24");
+    }
+
+    #[test]
+    fn top_month_counts_under_bars() {
+        let months = |counts: &[i64]| -> Vec<((i32, u32), i64)> {
+            counts.iter().enumerate().map(|(i, &n)| ((2025, i as u32 + 1), n)).collect()
+        };
+        // 31 と隣の 6 は重なるので、6 を飛ばして次に多い 4 に書く
+        assert_eq!(top_month_counts(&months(&[0, 31, 6, 0, 0, 4, 0, 2, 0, 9]), 1, 1, 20), " 31  4   9");
+        // 幅2・間隔1の棒
+        assert_eq!(top_month_counts(&months(&[5, 12, 3]), 3, 2, 9), "5  12 3");
+        // 右端の棒の回数は枠の内側へずらす
+        assert_eq!(top_month_counts(&months(&[0, 0, 0, 0, 100]), 1, 1, 5), "  100");
+        assert_eq!(top_month_counts(&months(&[0, 0]), 1, 1, 5), "");
     }
 
     #[test]
