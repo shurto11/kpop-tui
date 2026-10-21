@@ -2277,7 +2277,7 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
-    // 回数は Writer の Yearly と同じ黄色の太字
+    // 最多の回数は Writer の Yearly と同じ黄色の太字
     let value_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let max_year = years.iter().map(|&(_, n)| n).max().unwrap_or(0);
     let count_w = max_year.to_string().len();
@@ -2288,7 +2288,10 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(format!("{} ", short_year(y)), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:<bar_w$}", hbar(n, max_year, bar_w)), Style::default().fg(Color::Cyan)),
-                Span::styled(format!(" {:>count_w$}", n), value_style),
+                Span::styled(
+                    format!(" {:>count_w$}", n),
+                    if n == max_year { value_style } else { Style::default() },
+                ),
             ])
         })
         .collect();
@@ -2313,8 +2316,16 @@ fn draw_plays(frame: &mut Frame, app: &App, area: Rect) {
         .bar_gap(bar_gap as u16);
     frame.render_widget(month_chart, rows[2]);
 
-    let counts = top_month_counts(months, bar_width + bar_gap, bar_width, width);
-    frame.render_widget(Paragraph::new(Span::styled(counts, value_style)), rows[3]);
+    let max_month = months.iter().map(|&(_, n)| n).max().unwrap_or(0);
+    let mut count_spans: Vec<Span> = Vec::new();
+    let mut col = 0;
+    for (x, n) in top_month_counts(months, bar_width + bar_gap, bar_width, width) {
+        let text = n.to_string();
+        count_spans.push(Span::raw(" ".repeat(x - col)));
+        col = x + text.len();
+        count_spans.push(Span::styled(text, if n == max_month { value_style } else { Style::default() }));
+    }
+    frame.render_widget(Paragraph::new(Line::from(count_spans)), rows[3]);
 
     let axis = year_axis(months, bar_width + bar_gap, width);
     frame.render_widget(Paragraph::new(Span::styled(axis, Style::default().fg(Color::DarkGray))), rows[4]);
@@ -2357,28 +2368,29 @@ fn month_layout(months: usize, width: usize) -> (usize, usize, usize) {
 }
 
 /// 月グラフの棒の下に書く回数。多い月から3つまで、棒の真ん中の下に書く。
-/// 書いた回数と重なる月（隣の月など）は飛ばして、次に多い月に書く
-fn top_month_counts(months: &[((i32, u32), i64)], step: usize, bar_width: usize, width: usize) -> String {
+/// 書いた回数と重なる月（隣の月など）は飛ばして、次に多い月に書く。戻り値は (位置, 回数) の位置順
+fn top_month_counts(months: &[((i32, u32), i64)], step: usize, bar_width: usize, width: usize) -> Vec<(usize, i64)> {
     let mut order: Vec<usize> = (0..months.len()).filter(|&i| months[i].1 > 0).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(months[i].1));
 
-    let mut labels: Vec<(usize, String)> = Vec::new();
+    let mut labels: Vec<(usize, i64)> = Vec::new();
+    let len_of = |n: i64| n.to_string().len();
     for i in order {
         if labels.len() == 3 {
             break;
         }
-        let text = months[i].1.to_string();
-        let len = text.len();
+        let n = months[i].1;
+        let len = len_of(n);
         // 枠からはみ出すなら内側へずらす
         let x = ((i * step) as isize + (bar_width as isize - len as isize) / 2)
             .clamp(0, width.saturating_sub(len) as isize) as usize;
         // 隣の回数とは1文字空ける
-        if labels.iter().all(|(lx, l)| x + len < *lx || lx + l.len() < x) {
-            labels.push((x, text));
+        if labels.iter().all(|&(lx, ln)| x + len < lx || lx + len_of(ln) < x) {
+            labels.push((x, n));
         }
     }
     labels.sort();
-    place_labels(labels)
+    labels
 }
 
 /// 月グラフの目盛り。各年の1月の位置に年を書く。
@@ -2696,13 +2708,17 @@ mod plays_chart_tests {
         let months = |counts: &[i64]| -> Vec<((i32, u32), i64)> {
             counts.iter().enumerate().map(|(i, &n)| ((2025, i as u32 + 1), n)).collect()
         };
+        let line = |counts: &[i64], step, bar_width, width| {
+            let labels = top_month_counts(&months(counts), step, bar_width, width);
+            place_labels(labels.into_iter().map(|(x, n)| (x, n.to_string())).collect())
+        };
         // 31 と隣の 6 は重なるので、6 を飛ばして次に多い 4 に書く
-        assert_eq!(top_month_counts(&months(&[0, 31, 6, 0, 0, 4, 0, 2, 0, 9]), 1, 1, 20), " 31  4   9");
+        assert_eq!(line(&[0, 31, 6, 0, 0, 4, 0, 2, 0, 9], 1, 1, 20), " 31  4   9");
         // 幅2・間隔1の棒
-        assert_eq!(top_month_counts(&months(&[5, 12, 3]), 3, 2, 9), "5  12 3");
+        assert_eq!(line(&[5, 12, 3], 3, 2, 9), "5  12 3");
         // 右端の棒の回数は枠の内側へずらす
-        assert_eq!(top_month_counts(&months(&[0, 0, 0, 0, 100]), 1, 1, 5), "  100");
-        assert_eq!(top_month_counts(&months(&[0, 0]), 1, 1, 5), "");
+        assert_eq!(line(&[0, 0, 0, 0, 100], 1, 1, 5), "  100");
+        assert_eq!(line(&[0, 0], 1, 1, 5), "");
     }
 
     #[test]
